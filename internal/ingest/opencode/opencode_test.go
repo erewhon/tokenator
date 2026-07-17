@@ -114,14 +114,14 @@ func TestIngestFixture(t *testing.T) {
 	}
 
 	// Tool part resolves tool name and file path.
-	fileRows, err := st.AttrRollup("file", "")
+	fileRows, err := st.AttrRollup("file", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(fileRows) != 1 || fileRows[0].Group != "/home/user/webapp/app.py" {
 		t.Errorf("file attribution: %+v", fileRows)
 	}
-	toolRows, err := st.AttrRollup("tool", "")
+	toolRows, err := st.AttrRollup("tool", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

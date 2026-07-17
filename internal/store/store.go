@@ -522,12 +522,12 @@ type AttrRow struct {
 
 // AttrRollup aggregates extracted blocks. Flow attribution: each block is
 // counted once at its estimated size (tokens that ENTERED context), not
-// multiplied by residency.
+// multiplied by residency. sessionID narrows to one session; 0 means all.
 //   - tool: tool_result payloads grouped by tool name
 //   - mcp:  tool_use + tool_result grouped by MCP server
 //   - file: tool_result payloads grouped by file path
 //   - kind: everything grouped by block kind
-func (s *Store) AttrRollup(by, sinceTS string) ([]AttrRow, error) {
+func (s *Store) AttrRollup(by, sinceTS string, sessionID int64) ([]AttrRow, error) {
 	var groupExpr, where string
 	switch by {
 	case "tool":
@@ -545,10 +545,10 @@ func (s *Store) AttrRollup(by, sinceTS string) ([]AttrRow, error) {
 		SELECT `+groupExpr+` AS grp, COUNT(*),
 			SUM(b.is_error), SUM(b.byte_len), SUM(b.est_tokens)
 		FROM block b
-		WHERE `+where+` AND (? = '' OR b.ts >= ?)
+		WHERE `+where+` AND (? = '' OR b.ts >= ?) AND (? = 0 OR b.session_id = ?)
 		GROUP BY grp
 		ORDER BY SUM(b.est_tokens) DESC`,
-		sinceTS, sinceTS)
+		sinceTS, sinceTS, sessionID, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -630,6 +630,57 @@ func (s *Store) RepeatReads(sinceTS string, limit int) ([]RepeatReadRow, error) 
 			return nil, err
 		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SessionMeta identifies one session for the session view.
+type SessionMeta struct {
+	ID      int64
+	Key     string
+	Slug    string
+	Project string
+	Title   string
+	Agent   string
+}
+
+// SessionByPrefix resolves a harness-session-id or slug prefix to one
+// session; when several match, the most recently active wins.
+func (s *Store) SessionByPrefix(prefix string) (SessionMeta, error) {
+	var m SessionMeta
+	err := s.db.QueryRow(`
+		SELECT id, harness_session_id, slug, project, title, agent
+		FROM session
+		WHERE harness_session_id LIKE ? || '%' OR slug LIKE ? || '%'
+		ORDER BY ended_at DESC LIMIT 1`, prefix, prefix).Scan(
+		&m.ID, &m.Key, &m.Slug, &m.Project, &m.Title, &m.Agent)
+	if err == sql.ErrNoRows {
+		return m, fmt.Errorf("no session matches prefix %q", prefix)
+	}
+	return m, err
+}
+
+// SessionBlock is a block row for timeline bucketing.
+type SessionBlock struct {
+	TS        string
+	Kind      string
+	EstTokens int64
+}
+
+func (s *Store) BlocksForSession(sessionID int64) ([]SessionBlock, error) {
+	rows, err := s.db.Query(
+		`SELECT ts, kind, est_tokens FROM block WHERE session_id = ? ORDER BY ts`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SessionBlock
+	for rows.Next() {
+		var b SessionBlock
+		if err := rows.Scan(&b.TS, &b.Kind, &b.EstTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
 	}
 	return out, rows.Err()
 }

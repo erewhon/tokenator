@@ -38,6 +38,8 @@ func main() {
 		err = cmdWaste(os.Args[2:])
 	case "cache":
 		err = cmdCache(os.Args[2:])
+	case "session":
+		err = cmdSession(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "-h", "--help", "help":
@@ -61,6 +63,8 @@ commands:
   attr      block-level attribution (--by tool|mcp|file|kind)
   waste     repeat reads and oversized tool results
   cache     cache doctor: invalidation events, causes, reuse scores
+  session   single-session view: timeline, composition, events
+            (session <id-or-slug-prefix> [--html out.html])
   doctor    show database and source status
 
 common flags:
@@ -182,7 +186,7 @@ func cmdAttr(args []string) error {
 	if err != nil {
 		return err
 	}
-	rows, err := st.AttrRollup(*by, sinceTS)
+	rows, err := st.AttrRollup(*by, sinceTS, 0)
 	if err != nil {
 		return err
 	}
@@ -270,6 +274,46 @@ func cmdCache(args []string) error {
 		return report.RenderCacheSession(os.Stdout, aReqs, rep)
 	}
 	return report.RenderCacheSummary(os.Stdout, rep, *limit)
+}
+
+func cmdSession(args []string) error {
+	fs := flag.NewFlagSet("session", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDBPath(), "database path")
+	htmlOut := fs.String("html", "", "write a self-contained HTML page to this path instead of the terminal view")
+	// Accept the session prefix before or after flags (stdlib flag stops
+	// parsing at the first positional argument).
+	fs.Parse(args)
+	prefix := fs.Arg(0)
+	if fs.NArg() > 1 {
+		fs.Parse(fs.Args()[1:])
+	}
+	if prefix == "" {
+		return fmt.Errorf("usage: tokenator session [flags] <session-id-or-slug-prefix>")
+	}
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	view, err := report.BuildSessionView(st, prefix)
+	if err != nil {
+		return err
+	}
+	if *htmlOut != "" {
+		f, err := os.Create(*htmlOut)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if err := report.RenderSessionHTML(f, view); err != nil {
+			return err
+		}
+		log.Printf("wrote %s", *htmlOut)
+		return nil
+	}
+	return report.RenderSessionTerm(os.Stdout, view)
 }
 
 func cmdDoctor(args []string) error {
