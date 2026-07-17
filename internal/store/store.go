@@ -899,6 +899,79 @@ func (s *Store) RequestsForCache(sinceTS, sessionPrefix string) ([]CacheReq, err
 	return out, rows.Err()
 }
 
+// --- residency inputs ---
+
+// ResBlockRow feeds the residency analyzer (internal/analyze).
+type ResBlockRow struct {
+	SessionID  int64
+	Project    string
+	SessionKey string
+	TS         string
+	Kind       string
+	Tool       string
+	MCPServer  string
+	FilePath   string
+	EstTokens  int64
+}
+
+// BlocksForResidency returns all blocks of the sessions in the window. Like
+// RequestsForCache, the since filter applies at SESSION granularity: cutting
+// a session mid-way would misstate how long its early blocks stayed
+// resident.
+func (s *Store) BlocksForResidency(sinceTS string) ([]ResBlockRow, error) {
+	rows, err := s.db.Query(`
+		SELECT b.session_id, s.project, s.harness_session_id, b.ts, b.kind,
+			b.tool, b.mcp_server, b.file_path, b.est_tokens
+		FROM block b
+		JOIN session s ON s.id = b.session_id
+		WHERE (? = '' OR b.session_id IN (SELECT DISTINCT session_id FROM request WHERE ts >= ?))`,
+		sinceTS, sinceTS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ResBlockRow
+	for rows.Next() {
+		var r ResBlockRow
+		if err := rows.Scan(&r.SessionID, &r.Project, &r.SessionKey, &r.TS, &r.Kind,
+			&r.Tool, &r.MCPServer, &r.FilePath, &r.EstTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ReqStamp is one request's timestamp plus its metered prompt volume.
+type ReqStamp struct {
+	SessionID    int64
+	TS           string
+	PromptTokens int64
+}
+
+// RequestStamps returns request timestamps and prompt volumes for the same
+// session-granular window as BlocksForResidency.
+func (s *Store) RequestStamps(sinceTS string) ([]ReqStamp, error) {
+	rows, err := s.db.Query(`
+		SELECT session_id, ts, input_tokens + cache_read_tokens + cache_creation_tokens
+		FROM request
+		WHERE (? = '' OR session_id IN (SELECT DISTINCT session_id FROM request WHERE ts >= ?))`,
+		sinceTS, sinceTS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReqStamp
+	for rows.Next() {
+		var r ReqStamp
+		if err := rows.Scan(&r.SessionID, &r.TS, &r.PromptTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // CompactionTimes maps session id to its compact-boundary timestamps.
 func (s *Store) CompactionTimes() (map[int64][]string, error) {
 	rows, err := s.db.Query(`SELECT session_id, ts FROM compaction ORDER BY session_id, ts`)

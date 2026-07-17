@@ -66,8 +66,9 @@ func usage() {
 commands:
   ingest    ingest harness data (Claude Code + OpenCode) into the database
   report    usage rollups with cache splits (--by project|model|session)
-  attr      block-level attribution (--by tool|mcp|file|kind)
-  waste     repeat reads and oversized tool results
+  attr      block-level attribution (--by tool|mcp|file|kind; --residency
+            weights by est tokens × requests kept in context)
+  waste     repeat reads, oversized results, long-resident heavyweights
   cache     cache doctor: invalidation events, causes, reuse scores
   session   single-session view: timeline, composition, events
             (session <id-or-slug-prefix> [--html out.html])
@@ -181,6 +182,8 @@ func cmdAttr(args []string) error {
 	dbPath := fs.String("db", defaultDBPath(), "database path")
 	by := fs.String("by", "tool", "group by: tool|mcp|file|kind")
 	since := fs.String("since", "", "window like 7d, 24h (default: all time)")
+	residency := fs.Bool("residency", false,
+		"weight by residency (est tokens × requests kept in context) instead of entry size; --since applies per session")
 	fs.Parse(args)
 
 	st, err := store.Open(*dbPath)
@@ -192,6 +195,21 @@ func cmdAttr(args []string) error {
 	sinceTS, err := parseSince(*since)
 	if err != nil {
 		return err
+	}
+	if *residency {
+		rep, err := residencyReport(st, sinceTS)
+		if err != nil {
+			return err
+		}
+		if rep == nil {
+			log.Print("no blocks — run `tokenator ingest` (add --full once after upgrading)")
+			return nil
+		}
+		rows, ok := analyze.RollupResidency(rep.Items, *by)
+		if !ok {
+			return fmt.Errorf("unknown attr group %q (want tool, mcp, file, or kind)", *by)
+		}
+		return report.RenderAttrResidency(os.Stdout, *by, rows, rep)
 	}
 	rows, err := st.AttrRollup(*by, sinceTS, 0)
 	if err != nil {
@@ -206,6 +224,39 @@ func cmdAttr(args []string) error {
 		return err
 	}
 	return report.RenderAttr(os.Stdout, *by, rows, cal)
+}
+
+// residencyReport loads the residency inputs and runs the analyzer; nil
+// report (no error) means no blocks are extracted yet.
+func residencyReport(st *store.Store, sinceTS string) (*analyze.ResidencyReport, error) {
+	blocks, err := st.BlocksForResidency(sinceTS)
+	if err != nil {
+		return nil, err
+	}
+	if len(blocks) == 0 {
+		return nil, nil
+	}
+	stamps, err := st.RequestStamps(sinceTS)
+	if err != nil {
+		return nil, err
+	}
+	comps, err := st.CompactionTimes()
+	if err != nil {
+		return nil, err
+	}
+	aBlocks := make([]analyze.ResBlock, len(blocks))
+	for i, b := range blocks {
+		aBlocks[i] = analyze.ResBlock{
+			SessionID: b.SessionID, Project: b.Project, SessionKey: b.SessionKey,
+			TS: b.TS, Kind: b.Kind, Tool: b.Tool, MCPServer: b.MCPServer,
+			FilePath: b.FilePath, EstTokens: b.EstTokens,
+		}
+	}
+	aStamps := make([]analyze.Stamp, len(stamps))
+	for i, s := range stamps {
+		aStamps[i] = analyze.Stamp{SessionID: s.SessionID, TS: s.TS, PromptTokens: s.PromptTokens}
+	}
+	return analyze.Residency(aBlocks, aStamps, comps), nil
 }
 
 func cmdWaste(args []string) error {
@@ -233,7 +284,13 @@ func cmdWaste(args []string) error {
 	if err != nil {
 		return err
 	}
-	return report.RenderWaste(os.Stdout, reads, big)
+	var heavy []analyze.BlockResidency
+	if rep, err := residencyReport(st, sinceTS); err != nil {
+		return err
+	} else if rep != nil {
+		heavy = analyze.TopResidents(rep.Items, *limit)
+	}
+	return report.RenderWaste(os.Stdout, reads, big, heavy)
 }
 
 func cmdCache(args []string) error {

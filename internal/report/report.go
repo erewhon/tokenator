@@ -71,8 +71,44 @@ func RenderAttr(w io.Writer, by string, rows []store.AttrRow, cal store.Calibrat
 	return nil
 }
 
-// RenderWaste writes the repeat-read and oversized-result tables.
-func RenderWaste(w io.Writer, reads []store.RepeatReadRow, big []store.BigBlockRow) error {
+// RenderAttrResidency writes the residency-weighted attribution table.
+// RESIDENT TOK ≈ est tokens × requests the block stayed in context; AVG RES
+// is the size-weighted mean residency in requests.
+func RenderAttrResidency(w io.Writer, by string, rows []analyze.ResRow, rep *analyze.ResidencyReport) error {
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "%s\tBLOCKS\tFLOW TOK\tRESIDENT TOK\tAVG RES\tSHARE\n", strings.ToUpper(by))
+	var total analyze.ResRow
+	for _, r := range rows {
+		total.Blocks += r.Blocks
+		total.FlowTokens += r.FlowTokens
+		total.ResTokens += r.ResTokens
+	}
+	for _, r := range rows {
+		share := "-"
+		if total.ResTokens > 0 {
+			share = fmt.Sprintf("%.1f%%", 100*float64(r.ResTokens)/float64(total.ResTokens))
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%.0f\t%s\n",
+			truncate(r.Group, 56), comma(r.Blocks), comma(r.FlowTokens),
+			comma(r.ResTokens), r.MeanResident(), share)
+	}
+	if len(rows) > 1 {
+		fmt.Fprintf(tw, "TOTAL\t%s\t%s\t%s\t%.0f\t\n",
+			comma(total.Blocks), comma(total.FlowTokens), comma(total.ResTokens), total.MeanResident())
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "\nresident tok ≈ est tokens × requests the block stayed in context (compaction-bounded; thinking counted only within its turn) — read as shares\n")
+	fmt.Fprintf(w, "coverage: extracted resident %s vs %s metered prompt volume (%s)\n",
+		comma(rep.ExtractedRes), comma(rep.MeteredPrompt), pct(rep.ExtractedRes, rep.MeteredPrompt))
+	fmt.Fprintf(w, "(the gap is expected: system prompts, tool schemas, and harness injections are resident every request but not extracted)\n")
+	return nil
+}
+
+// RenderWaste writes the repeat-read, oversized-result, and long-resident
+// tables.
+func RenderWaste(w io.Writer, reads []store.RepeatReadRow, big []store.BigBlockRow, heavy []analyze.BlockResidency) error {
 	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "REPEAT READS (same file entering the same session more than once)\n")
 	fmt.Fprintf(tw, "PROJECT\tFILE\tREADS\tVERSIONS\tEST TOTAL\tEST WASTED\n")
@@ -90,7 +126,29 @@ func RenderWaste(w io.Writer, reads []store.RepeatReadRow, big []store.BigBlockR
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
 			truncate(b.Project, 24), b.Tool, truncate(b.FilePath, 48), comma(b.EstTokens), b.TS)
 	}
+	if len(heavy) > 0 {
+		fmt.Fprintf(tw, "\nLONG-RESIDENT HEAVYWEIGHTS (cost of keeping one block in context)\n")
+		fmt.Fprintf(tw, "PROJECT\tKIND\tORIGIN\tENTERED\tEST TOK\tRES×\tRESIDENT TOK\n")
+		for _, h := range heavy {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+				truncate(h.Project, 24), h.Kind, truncate(originOf(h), 44),
+				h.TS, comma(h.EstTokens), h.Resident, comma(h.ResTokens))
+		}
+	}
 	return tw.Flush()
+}
+
+// originOf names where a block came from, most specific field first.
+func originOf(h analyze.BlockResidency) string {
+	switch {
+	case h.FilePath != "":
+		return h.FilePath
+	case h.Tool != "":
+		return h.Tool
+	case h.MCPServer != "":
+		return h.MCPServer
+	}
+	return ""
 }
 
 func pct(num, den int64) string {
