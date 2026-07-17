@@ -27,6 +27,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/erewhon/tokenator/internal/estimate"
 	"github.com/erewhon/tokenator/internal/store"
 )
 
@@ -40,24 +41,29 @@ type Ingester struct {
 	// mixes providers (local, per-token remote) in one store, so the
 	// default is "mixed"; per-provider regime mapping is a later feature.
 	Regime string
+	// Full re-parses every file regardless of recorded size/mtime.
+	Full bool
 }
 
 type Stats struct {
-	SessionFiles int // session files parsed (changed since last run)
-	MessageFiles int // message files parsed (changed since last run)
-	FilesSkipped int
-	Sessions     int
-	Requests     int // new request rows
-	Updated      int // existing rows refreshed (message file mutated)
-	Incomplete   int // zero-token, not-yet-completed messages skipped
-	ParseErrors  int
+	SessionFiles  int // session files parsed (changed since last run)
+	MessageFiles  int // message files parsed (changed since last run)
+	PartFiles     int // part files parsed (changed since last run)
+	FilesSkipped  int
+	Sessions      int
+	Requests      int // new request rows
+	Updated       int // existing rows refreshed (message file mutated)
+	Incomplete    int // zero-token, not-yet-completed messages skipped
+	Blocks        int
+	BlocksUpdated int
+	ParseErrors   int
 }
 
 func (st Stats) String() string {
 	return fmt.Sprintf(
-		"session_files=%d message_files=%d (skipped %d unchanged) sessions=%d requests=+%d updated=%d incomplete=%d parse_errors=%d",
-		st.SessionFiles, st.MessageFiles, st.FilesSkipped, st.Sessions,
-		st.Requests, st.Updated, st.Incomplete, st.ParseErrors)
+		"session_files=%d message_files=%d part_files=%d (skipped %d unchanged) sessions=%d requests=+%d updated=%d incomplete=%d blocks=+%d/%d parse_errors=%d",
+		st.SessionFiles, st.MessageFiles, st.PartFiles, st.FilesSkipped, st.Sessions,
+		st.Requests, st.Updated, st.Incomplete, st.Blocks, st.BlocksUpdated, st.ParseErrors)
 }
 
 type sessionFile struct {
@@ -94,6 +100,37 @@ type messageFile struct {
 			Write int64 `json:"write"`
 		} `json:"cache"`
 	} `json:"tokens"`
+}
+
+// partFile is one content part (storage/part/<msgID>/prt_*.json).
+type partFile struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionID"`
+	MessageID string `json:"messageID"`
+	Type      string `json:"type"` // text | reasoning | tool | step-start | step-finish | patch
+	Text      string `json:"text"`
+	Tool      string `json:"tool"`
+	CallID    string `json:"callID"`
+	State     *struct {
+		Status string          `json:"status"`
+		Input  json.RawMessage `json:"input"`
+		Output json.RawMessage `json:"output"`
+	} `json:"state"`
+}
+
+type partToolInput struct {
+	FilePath    string `json:"filePath"`
+	FilePathAlt string `json:"file_path"`
+	Path        string `json:"path"`
+}
+
+func (pi partToolInput) path() string {
+	for _, p := range []string{pi.FilePath, pi.FilePathAlt, pi.Path} {
+		if p != "" {
+			return p
+		}
+	}
+	return ""
 }
 
 func (ing *Ingester) root() (string, error) {
@@ -142,6 +179,9 @@ func (ing *Ingester) Run(st *store.Store) (Stats, error) {
 			return 0, 0, false, err
 		}
 		size, mtime := fi.Size(), fi.ModTime().UnixNano()
+		if ing.Full {
+			return size, mtime, true, nil
+		}
 		prev, ok := states[path]
 		return size, mtime, !ok || prev.Size != size || prev.MtimeNS != mtime, nil
 	}
@@ -208,15 +248,84 @@ func (ing *Ingester) Run(st *store.Store) (Stats, error) {
 		parsedFiles = append(parsedFiles, fileRecord{path, size, mtime})
 	}
 
-	// Every session that has new metadata or new messages gets one upsert;
-	// sessions only present via messages get a shell row (metadata merges
-	// in whenever the session file next changes).
+	// Changed part files → blocks. Parts carry no role or timestamp of
+	// their own, so each looks up its parent message file (cached; parsed
+	// messages from this run pre-fill the cache).
+	msgCache := map[string]*messageFile{}
+	for _, msgs := range bySession {
+		for _, mf := range msgs {
+			msgCache[mf.ID] = mf
+		}
+	}
+	lookupMsg := func(sesID, msgID string) *messageFile {
+		if mf, ok := msgCache[msgID]; ok {
+			return mf
+		}
+		var mf messageFile
+		if err := readJSON(filepath.Join(root, "message", sesID, msgID+".json"), &mf); err != nil {
+			msgCache[msgID] = nil
+			return nil
+		}
+		msgCache[msgID] = &mf
+		return &mf
+	}
+
+	type pendingBlock struct {
+		sessionKey string
+		blk        store.Block
+	}
+	var pendingBlocks []pendingBlock
+	partPaths, err := filepath.Glob(filepath.Join(root, "part", "*", "*.json"))
+	if err != nil {
+		return stats, err
+	}
+	sort.Strings(partPaths)
+	for _, path := range partPaths {
+		size, mtime, isChanged, err := changed(path)
+		if err != nil {
+			return stats, err
+		}
+		if !isChanged {
+			stats.FilesSkipped++
+			continue
+		}
+		var pf partFile
+		if err := readJSON(path, &pf); err != nil || pf.ID == "" {
+			stats.ParseErrors++
+			continue
+		}
+		stats.PartFiles++
+		parsedFiles = append(parsedFiles, fileRecord{path, size, mtime})
+		sesID := pf.SessionID
+		msg := lookupMsg(sesID, pf.MessageID)
+		role, ts := "", ""
+		if msg != nil {
+			role = msg.Role
+			if sesID == "" {
+				sesID = msg.SessionID
+			}
+			ts = msToRFC3339(msg.Time.Created)
+		}
+		if sesID == "" {
+			continue
+		}
+		if blk, ok := blockFromPart(&pf, role, ts); ok {
+			pendingBlocks = append(pendingBlocks, pendingBlock{sessionKey: sesID, blk: blk})
+		}
+	}
+
+	// Every session that has new metadata, messages, or parts gets one
+	// upsert; sessions only present via messages/parts get a shell row
+	// (metadata merges in whenever the session file next changes).
 	touched := map[string]bool{}
 	for id := range sessMeta {
 		touched[id] = true
 	}
 	for id := range bySession {
 		touched[id] = true
+	}
+	for _, pb := range pendingBlocks {
+		touched[pb.sessionKey] = true
 	}
 	err = st.WithTx(func(tx *store.Tx) error {
 		ids := map[string]int64{}
@@ -282,6 +391,18 @@ func (ing *Ingester) Run(st *store.Store) (Stats, error) {
 				}
 			}
 		}
+		for _, pb := range pendingBlocks {
+			pb.blk.SessionID = ids[pb.sessionKey]
+			inserted, err := tx.UpsertBlock(pb.blk)
+			if err != nil {
+				return fmt.Errorf("upsert block %s: %w", pb.blk.DedupeKey, err)
+			}
+			if inserted {
+				stats.Blocks++
+			} else {
+				stats.BlocksUpdated++
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -295,6 +416,48 @@ func (ing *Ingester) Run(st *store.Store) (Stats, error) {
 	}
 	stats.Sessions = len(touched)
 	return stats, nil
+}
+
+// blockFromPart maps an OpenCode part to a block row. Reasoning parts map
+// to "thinking"; tool parts become a single tool_result block sized by the
+// output (the model-generated input is separate and small); step-start,
+// step-finish, and patch parts are bookkeeping, not context.
+func blockFromPart(pf *partFile, role, ts string) (store.Block, bool) {
+	blk := store.Block{TS: ts, DedupeKey: "oc:pb:" + pf.ID}
+	switch pf.Type {
+	case "text":
+		blk.Kind = "user_text"
+		if role == "assistant" {
+			blk.Kind = "assistant_text"
+		}
+		data := []byte(pf.Text)
+		blk.ByteLen = int64(len(data))
+		blk.ContentHash = estimate.Hash(data)
+	case "reasoning":
+		data := []byte(pf.Text)
+		blk.Kind = "thinking"
+		blk.ByteLen = int64(len(data))
+		blk.ContentHash = estimate.Hash(data)
+	case "tool":
+		blk.Kind = "tool_result"
+		blk.Tool = pf.Tool
+		blk.ToolUseID = "oc:" + pf.CallID
+		if pf.State != nil {
+			var pi partToolInput
+			json.Unmarshal(pf.State.Input, &pi)
+			blk.FilePath = pi.path()
+			blk.ByteLen = int64(len(pf.State.Output))
+			blk.ContentHash = estimate.Hash(pf.State.Output)
+			blk.IsError = pf.State.Status == "error"
+		}
+	default:
+		return blk, false
+	}
+	if blk.ByteLen == 0 {
+		return blk, false
+	}
+	blk.EstTokens = estimate.Tokens(int(blk.ByteLen))
+	return blk, true
 }
 
 func readJSON(path string, v any) error {

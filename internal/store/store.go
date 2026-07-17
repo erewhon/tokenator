@@ -85,7 +85,35 @@ CREATE TABLE ingest_file (
 );
 `
 
-var migrations = []string{schemaV1}
+// schemaV2 adds block-level attribution: one row per context item (text,
+// thinking, tool_use, tool_result, ...) with an origin classification.
+// byte_len/est_tokens are ESTIMATES (bytes/4); request rows remain the
+// ground truth for metered usage. Content itself is never stored — only
+// sizes and a truncated content hash for repeat detection.
+const schemaV2 = `
+CREATE TABLE block (
+	id           INTEGER PRIMARY KEY,
+	session_id   INTEGER NOT NULL REFERENCES session(id),
+	ts           TEXT NOT NULL DEFAULT '',
+	kind         TEXT NOT NULL,             -- user_text|meta_text|assistant_text|thinking|tool_use|tool_result|image
+	tool         TEXT NOT NULL DEFAULT '',  -- tool name for tool_use/tool_result
+	mcp_server   TEXT NOT NULL DEFAULT '',  -- parsed from mcp__<server>__<tool>
+	file_path    TEXT NOT NULL DEFAULT '',  -- for file-oriented tools (Read/Edit/Write/...)
+	tool_use_id  TEXT NOT NULL DEFAULT '',
+	request_key  TEXT NOT NULL DEFAULT '',  -- dedupe_key of the producing request, when known
+	byte_len     INTEGER NOT NULL DEFAULT 0,
+	est_tokens   INTEGER NOT NULL DEFAULT 0,
+	content_hash TEXT NOT NULL DEFAULT '',
+	is_error     INTEGER NOT NULL DEFAULT 0,
+	dedupe_key   TEXT NOT NULL UNIQUE
+);
+CREATE INDEX idx_block_session ON block(session_id);
+CREATE INDEX idx_block_kind ON block(kind);
+CREATE INDEX idx_block_tool ON block(tool) WHERE tool != '';
+CREATE INDEX idx_block_file ON block(file_path) WHERE file_path != '';
+`
+
+var migrations = []string{schemaV1, schemaV2}
 
 type Store struct {
 	db   *sql.DB
@@ -347,6 +375,52 @@ func (t *Tx) UpsertRequest(r Request) (bool, error) {
 	return !exists, err
 }
 
+type Block struct {
+	SessionID   int64
+	TS          string
+	Kind        string
+	Tool        string
+	MCPServer   string
+	FilePath    string
+	ToolUseID   string
+	RequestKey  string
+	ByteLen     int64
+	EstTokens   int64
+	ContentHash string
+	IsError     bool
+	DedupeKey   string
+}
+
+// UpsertBlock inserts or refreshes a block row by dedupe key, returning true
+// when the row is new. OpenCode part files mutate while streaming (text
+// grows), so sizes are refreshed on re-parse; Claude Code re-ingests are
+// no-op updates with identical values.
+func (t *Tx) UpsertBlock(b Block) (bool, error) {
+	var exists bool
+	if err := t.tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM block WHERE dedupe_key = ?)`, b.DedupeKey).Scan(&exists); err != nil {
+		return false, err
+	}
+	_, err := t.tx.Exec(`
+		INSERT INTO block (
+			session_id, ts, kind, tool, mcp_server, file_path, tool_use_id,
+			request_key, byte_len, est_tokens, content_hash, is_error, dedupe_key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (dedupe_key) DO UPDATE SET
+			ts = excluded.ts,
+			kind = excluded.kind,
+			tool = excluded.tool,
+			mcp_server = excluded.mcp_server,
+			file_path = excluded.file_path,
+			byte_len = excluded.byte_len,
+			est_tokens = excluded.est_tokens,
+			content_hash = excluded.content_hash,
+			is_error = excluded.is_error`,
+		b.SessionID, b.TS, b.Kind, b.Tool, b.MCPServer, b.FilePath, b.ToolUseID,
+		b.RequestKey, b.ByteLen, b.EstTokens, b.ContentHash, b.IsError, b.DedupeKey)
+	return !exists, err
+}
+
 type Compaction struct {
 	SessionID int64
 	TS        string
@@ -413,7 +487,7 @@ func (s *Store) Rollup(by, sinceTS string) ([]RollupRow, error) {
 }
 
 type TableCounts struct {
-	Sources, Sessions, Requests, Compactions, Files int64
+	Sources, Sessions, Requests, Blocks, Compactions, Files int64
 }
 
 func (s *Store) Counts() (TableCounts, error) {
@@ -425,6 +499,7 @@ func (s *Store) Counts() (TableCounts, error) {
 		{"source", &c.Sources},
 		{"session", &c.Sessions},
 		{"request", &c.Requests},
+		{"block", &c.Blocks},
 		{"compaction", &c.Compactions},
 		{"ingest_file", &c.Files},
 	} {
@@ -433,4 +508,160 @@ func (s *Store) Counts() (TableCounts, error) {
 		}
 	}
 	return c, nil
+}
+
+// --- attribution ---
+
+type AttrRow struct {
+	Group     string
+	Blocks    int64
+	Errors    int64
+	Bytes     int64
+	EstTokens int64
+}
+
+// AttrRollup aggregates extracted blocks. Flow attribution: each block is
+// counted once at its estimated size (tokens that ENTERED context), not
+// multiplied by residency.
+//   - tool: tool_result payloads grouped by tool name
+//   - mcp:  tool_use + tool_result grouped by MCP server
+//   - file: tool_result payloads grouped by file path
+//   - kind: everything grouped by block kind
+func (s *Store) AttrRollup(by, sinceTS string) ([]AttrRow, error) {
+	var groupExpr, where string
+	switch by {
+	case "tool":
+		groupExpr, where = `COALESCE(NULLIF(b.tool,''),'(unresolved)')`, `b.kind = 'tool_result'`
+	case "mcp":
+		groupExpr, where = `b.mcp_server`, `b.mcp_server != ''`
+	case "file":
+		groupExpr, where = `b.file_path`, `b.kind = 'tool_result' AND b.file_path != ''`
+	case "kind":
+		groupExpr, where = `b.kind`, `1=1`
+	default:
+		return nil, fmt.Errorf("unknown attr group %q (want tool, mcp, file, or kind)", by)
+	}
+	rows, err := s.db.Query(`
+		SELECT `+groupExpr+` AS grp, COUNT(*),
+			SUM(b.is_error), SUM(b.byte_len), SUM(b.est_tokens)
+		FROM block b
+		WHERE `+where+` AND (? = '' OR b.ts >= ?)
+		GROUP BY grp
+		ORDER BY SUM(b.est_tokens) DESC`,
+		sinceTS, sinceTS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AttrRow
+	for rows.Next() {
+		var r AttrRow
+		if err := rows.Scan(&r.Group, &r.Blocks, &r.Errors, &r.Bytes, &r.EstTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// Calibration compares block estimates against metered request usage over
+// the same window, split by direction. Input-side blocks (user/meta text,
+// tool results) correspond to NEW prompt tokens (input + cache_creation);
+// output-side blocks (assistant text, thinking, tool_use) to output tokens.
+// Coverage below 100% is expected — system prompts, tool schemas, and
+// harness injections are metered but not extracted as blocks.
+type Calibration struct {
+	InBlockEst  int64 // est tokens of input-side blocks
+	InMetered   int64 // SUM(input + cache_creation) over requests
+	OutBlockEst int64 // est tokens of output-side blocks
+	OutMetered  int64 // SUM(output) over requests
+}
+
+func (s *Store) Calibrate(sinceTS string) (Calibration, error) {
+	var c Calibration
+	err := s.db.QueryRow(`
+		SELECT
+			COALESCE(SUM(CASE WHEN kind IN ('user_text','meta_text','tool_result','image') THEN est_tokens END), 0),
+			COALESCE(SUM(CASE WHEN kind IN ('assistant_text','thinking','tool_use') THEN est_tokens END), 0)
+		FROM block WHERE (? = '' OR ts >= ?)`, sinceTS, sinceTS).Scan(&c.InBlockEst, &c.OutBlockEst)
+	if err != nil {
+		return c, err
+	}
+	err = s.db.QueryRow(`
+		SELECT COALESCE(SUM(input_tokens + cache_creation_tokens), 0), COALESCE(SUM(output_tokens), 0)
+		FROM request WHERE (? = '' OR ts >= ?)`, sinceTS, sinceTS).Scan(&c.InMetered, &c.OutMetered)
+	return c, err
+}
+
+// --- waste ---
+
+type RepeatReadRow struct {
+	Project   string
+	Session   string
+	FilePath  string
+	Reads     int64
+	Versions  int64 // distinct content hashes; 1 = identical bytes re-read
+	EstTotal  int64
+	EstWasted int64 // total minus the largest single read
+}
+
+// RepeatReads finds files whose contents entered the SAME session more than
+// once via tool results. Versions==1 means byte-identical re-reads.
+func (s *Store) RepeatReads(sinceTS string, limit int) ([]RepeatReadRow, error) {
+	rows, err := s.db.Query(`
+		SELECT s.project, s.harness_session_id, b.file_path, COUNT(*),
+			COUNT(DISTINCT b.content_hash),
+			SUM(b.est_tokens), SUM(b.est_tokens) - MAX(b.est_tokens)
+		FROM block b JOIN session s ON s.id = b.session_id
+		WHERE b.kind = 'tool_result' AND b.file_path != '' AND (? = '' OR b.ts >= ?)
+		GROUP BY b.session_id, b.file_path
+		HAVING COUNT(*) > 1
+		ORDER BY SUM(b.est_tokens) - MAX(b.est_tokens) DESC
+		LIMIT ?`, sinceTS, sinceTS, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RepeatReadRow
+	for rows.Next() {
+		var r RepeatReadRow
+		if err := rows.Scan(&r.Project, &r.Session, &r.FilePath, &r.Reads,
+			&r.Versions, &r.EstTotal, &r.EstWasted); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+type BigBlockRow struct {
+	Project   string
+	Tool      string
+	FilePath  string
+	EstTokens int64
+	TS        string
+}
+
+// BiggestResults lists the largest single tool results — candidates for
+// output compression (rtk-style) or narrower reads.
+func (s *Store) BiggestResults(sinceTS string, limit int) ([]BigBlockRow, error) {
+	rows, err := s.db.Query(`
+		SELECT s.project, COALESCE(NULLIF(b.tool,''),'(unresolved)'), b.file_path, b.est_tokens, b.ts
+		FROM block b JOIN session s ON s.id = b.session_id
+		WHERE b.kind = 'tool_result' AND (? = '' OR b.ts >= ?)
+		ORDER BY b.est_tokens DESC
+		LIMIT ?`, sinceTS, sinceTS, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BigBlockRow
+	for rows.Next() {
+		var r BigBlockRow
+		if err := rows.Scan(&r.Project, &r.Tool, &r.FilePath, &r.EstTokens, &r.TS); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

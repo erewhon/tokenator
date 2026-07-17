@@ -67,6 +67,28 @@ func fixture(t *testing.T) string {
 		"tokens": map[string]any{"total": 0, "input": 0, "output": 0, "reasoning": 0,
 			"cache": map[string]any{"read": 0, "write": 0}},
 	})
+	// Content parts: user text, assistant text, and a tool call with output.
+	writeJSON(t, filepath.Join(root, "part", "msg_user1", "prt_u1.json"), map[string]any{
+		"id": "prt_u1", "sessionID": ses, "messageID": "msg_user1",
+		"type": "text", "text": "hello opencode",
+	})
+	writeJSON(t, filepath.Join(root, "part", "msg_asst1", "prt_a1.json"), map[string]any{
+		"id": "prt_a1", "sessionID": ses, "messageID": "msg_asst1",
+		"type": "text", "text": "here's the fix",
+	})
+	writeJSON(t, filepath.Join(root, "part", "msg_asst1", "prt_t1.json"), map[string]any{
+		"id": "prt_t1", "sessionID": ses, "messageID": "msg_asst1",
+		"type": "tool", "tool": "read", "callID": "call_1",
+		"state": map[string]any{
+			"status": "completed",
+			"input":  map[string]any{"filePath": "/home/user/webapp/app.py"},
+			"output": "print('hi')",
+		},
+	})
+	// step-start parts are bookkeeping and must not become blocks.
+	writeJSON(t, filepath.Join(root, "part", "msg_asst1", "prt_s1.json"), map[string]any{
+		"id": "prt_s1", "sessionID": ses, "messageID": "msg_asst1", "type": "step-start",
+	})
 	return root
 }
 
@@ -85,6 +107,26 @@ func TestIngestFixture(t *testing.T) {
 	if stats.Requests != 1 || stats.Updated != 0 || stats.Incomplete != 1 {
 		t.Errorf("got requests=%d updated=%d incomplete=%d, want 1/0/1",
 			stats.Requests, stats.Updated, stats.Incomplete)
+	}
+	if stats.PartFiles != 4 || stats.Blocks != 3 {
+		t.Errorf("parts: got %d files / %d blocks, want 4 files -> 3 blocks (step-start skipped)",
+			stats.PartFiles, stats.Blocks)
+	}
+
+	// Tool part resolves tool name and file path.
+	fileRows, err := st.AttrRollup("file", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fileRows) != 1 || fileRows[0].Group != "/home/user/webapp/app.py" {
+		t.Errorf("file attribution: %+v", fileRows)
+	}
+	toolRows, err := st.AttrRollup("tool", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(toolRows) != 1 || toolRows[0].Group != "read" {
+		t.Errorf("tool attribution: %+v", toolRows)
 	}
 
 	rows, err := st.Rollup("project", "")
