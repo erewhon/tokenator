@@ -4,10 +4,12 @@ package report
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 
+	"github.com/erewhon/tokenator/internal/analyze"
 	"github.com/erewhon/tokenator/internal/store"
 )
 
@@ -96,6 +98,81 @@ func pct(num, den int64) string {
 		return "-"
 	}
 	return fmt.Sprintf("%.0f%%", 100*float64(num)/float64(den))
+}
+
+// RenderCacheSummary writes the cache doctor's aggregate view.
+func RenderCacheSummary(w io.Writer, rep *analyze.CacheReport, limit int) error {
+	fmt.Fprintf(w, "CACHE DOCTOR (offline analysis from usage sequences)\n")
+	fmt.Fprintf(w, "sessions with cache activity: %s   invalidation events: %s\n",
+		comma(int64(len(rep.Sessions))), comma(int64(len(rep.Events))))
+	if rep.Expected > 0 {
+		fmt.Fprintf(w, "warm-prefix reuse: %.1f%%   tokens re-processed after invalidations: %s\n",
+			100*float64(rep.Read)/float64(rep.Expected), comma(rep.Shortfall))
+	}
+
+	fmt.Fprintf(w, "\n")
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "CAUSE\tEVENTS\tTOKENS RE-PROCESSED\n")
+	causes := make([]string, 0, len(rep.ByCause))
+	for c := range rep.ByCause {
+		causes = append(causes, c)
+	}
+	sort.Slice(causes, func(i, j int) bool {
+		return rep.ByCause[causes[i]].Shortfall > rep.ByCause[causes[j]].Shortfall
+	})
+	for _, c := range causes {
+		a := rep.ByCause[c]
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", c, comma(int64(a.Events)), comma(a.Shortfall))
+	}
+	if len(causes) == 0 {
+		fmt.Fprintf(tw, "(no invalidation events)\t\t\n")
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(w, "\nWORST SESSIONS (by tokens re-processed)\n")
+	tw = tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "PROJECT\tSESSION\tEVENTS\tRE-PROCESSED\tREUSE\n")
+	n := 0
+	for _, s := range rep.Sessions {
+		if s.Events == 0 || n >= limit {
+			continue
+		}
+		n++
+		label := s.SessionKey
+		if s.Title != "" {
+			label = truncate(s.SessionKey, 12) + " — " + s.Title
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%.1f%%\n",
+			truncate(s.Project, 24), truncate(label, 52),
+			comma(int64(s.Events)), comma(s.Shortfall), 100*s.Reuse())
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "\ncauses: history_edit = request body changed (incl. microcompact/context edits); ttl_expiry = idle gap outlived the cache; compaction = expected rewrite at a compact boundary\n")
+	return nil
+}
+
+// RenderCacheSession writes the per-request drill-down for one session (or
+// a small set matching a prefix), marking invalidation events inline.
+func RenderCacheSession(w io.Writer, reqs []analyze.Req, rep *analyze.CacheReport) error {
+	events := map[string]analyze.Event{}
+	for _, ev := range rep.Events {
+		events[ev.TS+"|"+ev.Model] = ev
+	}
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "TS\tMODEL\tINPUT\tCACHE RD\tCACHE WR\tNOTE\n")
+	for _, r := range reqs {
+		note := ""
+		if ev, ok := events[r.TS+"|"+r.Model]; ok {
+			note = fmt.Sprintf("⚠ %s (re-processed %s)", ev.Cause, comma(ev.Shortfall))
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			r.TS, truncate(r.Model, 24), comma(r.Input), comma(r.CacheRead), comma(r.CacheWrite), note)
+	}
+	return tw.Flush()
 }
 
 func headerFor(by string) string {
