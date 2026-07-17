@@ -249,7 +249,7 @@ func residencyReport(st *store.Store, sinceTS string) (*analyze.ResidencyReport,
 		aBlocks[i] = analyze.ResBlock{
 			SessionID: b.SessionID, Project: b.Project, SessionKey: b.SessionKey,
 			TS: b.TS, Kind: b.Kind, Tool: b.Tool, MCPServer: b.MCPServer,
-			FilePath: b.FilePath, EstTokens: b.EstTokens,
+			FilePath: b.FilePath, EstTokens: b.EstTokens, Referenced: int(b.Referenced),
 		}
 	}
 	aStamps := make([]analyze.Stamp, len(stamps))
@@ -284,13 +284,16 @@ func cmdWaste(args []string) error {
 	if err != nil {
 		return err
 	}
-	var heavy []analyze.BlockResidency
+	var heavy, stale []analyze.BlockResidency
+	var staleKnown, staleUnref int64
 	if rep, err := residencyReport(st, sinceTS); err != nil {
 		return err
 	} else if rep != nil {
 		heavy = analyze.TopResidents(rep.Items, *limit)
+		stale = analyze.StalePassengers(rep.Items, *limit)
+		staleKnown, staleUnref = analyze.StaleShare(rep.Items)
 	}
-	return report.RenderWaste(os.Stdout, reads, big, heavy)
+	return report.RenderWaste(os.Stdout, reads, big, heavy, stale, staleKnown, staleUnref)
 }
 
 func cmdCache(args []string) error {

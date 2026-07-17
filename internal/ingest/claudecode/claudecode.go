@@ -70,14 +70,16 @@ type Stats struct {
 	Compactions   int
 	Blocks        int
 	BlocksUpdated int
+	RefsFound     int // tool results referenced by later content
+	RefsMissing   int // tool results analyzed but never referenced
 }
 
 func (st Stats) String() string {
 	return fmt.Sprintf(
-		"files=%d (skipped %d unchanged) lines=%d parse_errors=%d sessions=%d requests=+%d dup=%d synthetic=%d compactions=%d blocks=+%d/%d",
+		"files=%d (skipped %d unchanged) lines=%d parse_errors=%d sessions=%d requests=+%d dup=%d synthetic=%d compactions=%d blocks=+%d/%d refs=%d/%d",
 		st.Files, st.FilesSkipped, st.Lines, st.ParseErrors, st.Sessions,
 		st.Requests, st.Duplicates, st.Synthetic, st.Compactions,
-		st.Blocks, st.BlocksUpdated)
+		st.Blocks, st.BlocksUpdated, st.RefsFound, st.RefsFound+st.RefsMissing)
 }
 
 // line is the union of the top-level transcript fields we care about.
@@ -243,6 +245,7 @@ type fileCtx struct {
 	compactions []pendingCompaction
 	blocks      []pendingBlock
 	toolUses    map[string]toolMeta
+	refs        *refTracker
 	stats       *Stats
 }
 
@@ -343,6 +346,7 @@ func (ing *Ingester) ingestFile(st *store.Store, sourceID int64, path string, st
 		fileStem: strings.TrimSuffix(filepath.Base(path), ".jsonl"),
 		sessions: map[string]*sessAgg{},
 		toolUses: map[string]toolMeta{},
+		refs:     newRefTracker(),
 		stats:    stats,
 	}
 
@@ -362,6 +366,10 @@ func (ing *Ingester) ingestFile(st *store.Store, sourceID int64, path string, st
 			return readErr
 		}
 	}
+
+	refd, unrefd := fc.refs.finalize(fc.blocks)
+	stats.RefsFound += refd
+	stats.RefsMissing += unrefd
 
 	return st.WithTx(func(tx *store.Tx) error {
 		ids := make(map[string]int64, len(fc.sessions))
@@ -515,6 +523,7 @@ func (fc *fileCtx) handleAssistant(key string, ln *line) {
 		switch cb.Type {
 		case "text":
 			data := []byte(cb.Text)
+			fc.refs.observeText(ln.Timestamp, data)
 			fc.addBlock(key, store.Block{
 				TS: ln.Timestamp, Kind: "assistant_text", RequestKey: reqKey,
 				ByteLen: int64(len(data)), ContentHash: estimate.Hash(data),
@@ -522,12 +531,14 @@ func (fc *fileCtx) handleAssistant(key string, ln *line) {
 			})
 		case "thinking":
 			data := []byte(cb.Thinking)
+			fc.refs.observeText(ln.Timestamp, data)
 			fc.addBlock(key, store.Block{
 				TS: ln.Timestamp, Kind: "thinking", RequestKey: reqKey,
 				ByteLen: int64(len(data)), ContentHash: estimate.Hash(data),
 				DedupeKey: "cc:ab:" + m.ID + ":" + ln.RequestID + ":th:" + estimate.Hash(data),
 			})
 		case "tool_use":
+			fc.refs.observeToolInput(ln.Timestamp, cb.Input)
 			var ti toolInput
 			json.Unmarshal(cb.Input, &ti) // best-effort; not all inputs have paths
 			meta := toolMeta{tool: cb.Name, mcp: mcpServer(cb.Name), file: ti.path()}
@@ -566,6 +577,12 @@ func (fc *fileCtx) handleUser(key string, ln *line) {
 	}
 	addText := func(text string) {
 		data := []byte(text)
+		// Only HUMAN text is a reference source: meta_text is
+		// harness-generated (hook output, reminders) and would fabricate
+		// references, e.g. a PostToolUse hook echoing the file it saw.
+		if textKind == "user_text" {
+			fc.refs.observeText(ln.Timestamp, data)
+		}
 		ns := ln.PromptID
 		if ns == "" {
 			// promptId is stable across the file copies that resume/fork
@@ -628,6 +645,9 @@ func (fc *fileCtx) handleUser(key string, ln *line) {
 				ContentHash: estimate.Hash(cb.Content), IsError: cb.IsError,
 				DedupeKey: dk,
 			})
+			if len(cb.Content) > 0 { // addBlock drops empty blocks — keep indexes aligned
+				fc.refs.addResult(len(fc.blocks)-1, cb.Content)
+			}
 		}
 	}
 }

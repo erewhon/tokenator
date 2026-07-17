@@ -106,9 +106,11 @@ func RenderAttrResidency(w io.Writer, by string, rows []analyze.ResRow, rep *ana
 	return nil
 }
 
-// RenderWaste writes the repeat-read, oversized-result, and long-resident
-// tables.
-func RenderWaste(w io.Writer, reads []store.RepeatReadRow, big []store.BigBlockRow, heavy []analyze.BlockResidency) error {
+// RenderWaste writes the repeat-read, oversized-result, long-resident, and
+// stale-passenger tables. staleKnown/staleUnref are resident-token sums over
+// tool results with a reference verdict.
+func RenderWaste(w io.Writer, reads []store.RepeatReadRow, big []store.BigBlockRow,
+	heavy, stale []analyze.BlockResidency, staleKnown, staleUnref int64) error {
 	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "REPEAT READS (same file entering the same session more than once)\n")
 	fmt.Fprintf(tw, "PROJECT\tFILE\tREADS\tVERSIONS\tEST TOTAL\tEST WASTED\n")
@@ -128,14 +130,41 @@ func RenderWaste(w io.Writer, reads []store.RepeatReadRow, big []store.BigBlockR
 	}
 	if len(heavy) > 0 {
 		fmt.Fprintf(tw, "\nLONG-RESIDENT HEAVYWEIGHTS (cost of keeping one block in context)\n")
-		fmt.Fprintf(tw, "PROJECT\tKIND\tORIGIN\tENTERED\tEST TOK\tRES×\tRESIDENT TOK\n")
+		fmt.Fprintf(tw, "PROJECT\tKIND\tORIGIN\tENTERED\tEST TOK\tRES×\tRESIDENT TOK\tREF\n")
 		for _, h := range heavy {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
 				truncate(h.Project, 24), h.Kind, truncate(originOf(h), 44),
-				h.TS, comma(h.EstTokens), h.Resident, comma(h.ResTokens))
+				h.TS, comma(h.EstTokens), h.Resident, comma(h.ResTokens), refMark(h.Referenced))
 		}
 	}
-	return tw.Flush()
+	if len(stale) > 0 {
+		fmt.Fprintf(tw, "\nSTALE PASSENGERS (tool results likely never referenced after entering)\n")
+		fmt.Fprintf(tw, "PROJECT\tTOOL\tORIGIN\tENTERED\tEST TOK\tRES×\tRESIDENT TOK\n")
+		for _, s := range stale {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+				truncate(s.Project, 24), s.Tool, truncate(originOf(s), 44),
+				s.TS, comma(s.EstTokens), s.Resident, comma(s.ResTokens))
+		}
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if staleKnown > 0 {
+		fmt.Fprintf(w, "\nof %s resident tool-result tokens with a reference verdict, %s (%s) were never referenced by later text, thinking, tool calls, or your messages — identifier-overlap heuristic, read as \"likely\"\n",
+			comma(staleKnown), comma(staleUnref), pct(staleUnref, staleKnown))
+	}
+	return nil
+}
+
+// refMark renders a reference verdict: y referenced, n never, ? unanalyzed.
+func refMark(referenced int) string {
+	switch referenced {
+	case 1:
+		return "y"
+	case 2:
+		return "n"
+	}
+	return "?"
 }
 
 // originOf names where a block came from, most specific field first.

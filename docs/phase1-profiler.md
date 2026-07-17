@@ -108,7 +108,7 @@ Without the wire prefix (that's phase 2), infer from usage sequences within a se
 ### Waste heuristics (each independently toggleable, each reported with evidence)
 
 - **Repeat reads**: same `file_content` content_hash entering context >1× in a session.
-- **Stale passengers**: tool_result blocks resident for many requests with no later reference (identifier-overlap heuristic against subsequent assistant/user text; report as "likely", not fact). *Partially implemented* as `waste`'s long-resident heavyweights: residency cost is computed, but "no later reference" is not — block content is deliberately not stored, so reference detection would need an ingest-time signature (future).
+- **Stale passengers**: tool_result blocks resident for many requests with no later reference (identifier-overlap heuristic; reported as "likely", not fact). *Implemented* at ingest time (content is never stored, so the judgment happens while it's in hand): tool results register distinctive identifiers (code-shaped tokens; path-shaped ones also register their basename since prefixes differ between citer and cited); later assistant text/thinking, tool-call input values, and human (not meta) user text consume them. Verdict on the block row: referenced / unreferenced / unknown — two distinct hits to call referenced, zero to call unreferenced, partial evidence abstains, identifiers claimed by >8 results are ambient and credit no one. Real-data: 81% of judged results referenced; 33% of judged resident tool-result tokens never were.
 - **Oversized results**: tool results above a percentile threshold, grouped by tool — the "should rtk handle this?" report.
 - **Schema overhead**: resident tool/MCP schema tokens vs how often each tool was actually called.
 

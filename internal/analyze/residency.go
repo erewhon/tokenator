@@ -26,6 +26,8 @@ import "sort"
 
 // ResBlock is one extracted block. TS ordering must be consistent with the
 // request stamps of the same session (both come from harness timestamps).
+// Referenced mirrors store.Ref*: 0 unknown, 1 referenced, 2 analyzed and
+// never referenced.
 type ResBlock struct {
 	SessionID  int64
 	Project    string
@@ -36,6 +38,7 @@ type ResBlock struct {
 	MCPServer  string
 	FilePath   string
 	EstTokens  int64
+	Referenced int
 }
 
 // Stamp is one request: its timestamp and metered prompt volume
@@ -204,4 +207,38 @@ func TopResidents(items []BlockResidency, n int) []BlockResidency {
 		sorted = sorted[:n]
 	}
 	return sorted
+}
+
+// StalePassengers returns the n costliest tool results that ingest-time
+// reference detection judged never referenced by later session content.
+// The verdict is a heuristic — read as "likely dead weight", not fact.
+func StalePassengers(items []BlockResidency, n int) []BlockResidency {
+	var stale []BlockResidency
+	for _, it := range items {
+		if it.Kind == "tool_result" && it.Referenced == 2 {
+			stale = append(stale, it)
+		}
+	}
+	sort.Slice(stale, func(i, j int) bool { return stale[i].ResTokens > stale[j].ResTokens })
+	if len(stale) > n {
+		stale = stale[:n]
+	}
+	return stale
+}
+
+// StaleShare sums resident tokens of tool results WITH a verdict, split into
+// (known, unreferenced) — the headline "X% of judged resident tool-result
+// tokens bought nothing" ratio. Unknown-verdict blocks are excluded from
+// both sides.
+func StaleShare(items []BlockResidency) (known, unref int64) {
+	for _, it := range items {
+		if it.Kind != "tool_result" || it.Referenced == 0 {
+			continue
+		}
+		known += it.ResTokens
+		if it.Referenced == 2 {
+			unref += it.ResTokens
+		}
+	}
+	return known, unref
 }

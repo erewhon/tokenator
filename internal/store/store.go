@@ -177,7 +177,24 @@ CREATE INDEX idx_otel_event_event ON otel_event(event);
 CREATE INDEX idx_otel_event_request ON otel_event(request_id) WHERE request_id != '';
 `
 
-var migrations = []string{schemaV1, schemaV2, schemaV3}
+// schemaV4 adds reference verdicts to blocks (stale-passenger detection).
+// Computed at ingest time — content is never stored, so this is the only
+// place the judgment can be made. 0 = unknown (not analyzed: pre-v4 rows,
+// OpenCode blocks, results yielding no identifiers), 1 = referenced by later
+// session content, 2 = analyzed and never referenced.
+const schemaV4 = `
+ALTER TABLE block ADD COLUMN referenced INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE block ADD COLUMN first_ref_ts TEXT NOT NULL DEFAULT '';
+`
+
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4}
+
+// Block.Referenced states.
+const (
+	RefUnknown      = 0
+	RefReferenced   = 1
+	RefUnreferenced = 2
+)
 
 type Store struct {
 	db   *sql.DB
@@ -452,6 +469,8 @@ type Block struct {
 	EstTokens   int64
 	ContentHash string
 	IsError     bool
+	Referenced  int64  // RefUnknown | RefReferenced | RefUnreferenced
+	FirstRefTS  string // ts of the first later reference, when known
 	DedupeKey   string
 }
 
@@ -465,11 +484,15 @@ func (t *Tx) UpsertBlock(b Block) (bool, error) {
 		`SELECT EXISTS(SELECT 1 FROM block WHERE dedupe_key = ?)`, b.DedupeKey).Scan(&exists); err != nil {
 		return false, err
 	}
+	// Reference merge: a referenced verdict from ANY file copy sticks (a
+	// resumed session's copy sees more later context than the original);
+	// otherwise any known verdict beats unknown.
 	_, err := t.tx.Exec(`
 		INSERT INTO block (
 			session_id, ts, kind, tool, mcp_server, file_path, tool_use_id,
-			request_key, byte_len, est_tokens, content_hash, is_error, dedupe_key
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			request_key, byte_len, est_tokens, content_hash, is_error,
+			referenced, first_ref_ts, dedupe_key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (dedupe_key) DO UPDATE SET
 			ts = excluded.ts,
 			kind = excluded.kind,
@@ -479,9 +502,19 @@ func (t *Tx) UpsertBlock(b Block) (bool, error) {
 			byte_len = excluded.byte_len,
 			est_tokens = excluded.est_tokens,
 			content_hash = excluded.content_hash,
-			is_error = excluded.is_error`,
+			is_error = excluded.is_error,
+			referenced = CASE
+				WHEN block.referenced = 1 OR excluded.referenced = 1 THEN 1
+				WHEN excluded.referenced != 0 THEN excluded.referenced
+				ELSE block.referenced END,
+			first_ref_ts = CASE
+				WHEN block.first_ref_ts = '' THEN excluded.first_ref_ts
+				WHEN excluded.first_ref_ts = '' THEN block.first_ref_ts
+				WHEN excluded.first_ref_ts < block.first_ref_ts THEN excluded.first_ref_ts
+				ELSE block.first_ref_ts END`,
 		b.SessionID, b.TS, b.Kind, b.Tool, b.MCPServer, b.FilePath, b.ToolUseID,
-		b.RequestKey, b.ByteLen, b.EstTokens, b.ContentHash, b.IsError, b.DedupeKey)
+		b.RequestKey, b.ByteLen, b.EstTokens, b.ContentHash, b.IsError,
+		b.Referenced, b.FirstRefTS, b.DedupeKey)
 	return !exists, err
 }
 
@@ -912,6 +945,7 @@ type ResBlockRow struct {
 	MCPServer  string
 	FilePath   string
 	EstTokens  int64
+	Referenced int64
 }
 
 // BlocksForResidency returns all blocks of the sessions in the window. Like
@@ -921,7 +955,7 @@ type ResBlockRow struct {
 func (s *Store) BlocksForResidency(sinceTS string) ([]ResBlockRow, error) {
 	rows, err := s.db.Query(`
 		SELECT b.session_id, s.project, s.harness_session_id, b.ts, b.kind,
-			b.tool, b.mcp_server, b.file_path, b.est_tokens
+			b.tool, b.mcp_server, b.file_path, b.est_tokens, b.referenced
 		FROM block b
 		JOIN session s ON s.id = b.session_id
 		WHERE (? = '' OR b.session_id IN (SELECT DISTINCT session_id FROM request WHERE ts >= ?))`,
@@ -934,7 +968,7 @@ func (s *Store) BlocksForResidency(sinceTS string) ([]ResBlockRow, error) {
 	for rows.Next() {
 		var r ResBlockRow
 		if err := rows.Scan(&r.SessionID, &r.Project, &r.SessionKey, &r.TS, &r.Kind,
-			&r.Tool, &r.MCPServer, &r.FilePath, &r.EstTokens); err != nil {
+			&r.Tool, &r.MCPServer, &r.FilePath, &r.EstTokens, &r.Referenced); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
