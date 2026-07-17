@@ -113,7 +113,71 @@ CREATE INDEX idx_block_tool ON block(tool) WHERE tool != '';
 CREATE INDEX idx_block_file ON block(file_path) WHERE file_path != '';
 `
 
-var migrations = []string{schemaV1, schemaV2}
+// schemaV3 adds OTel capture: datapoints from Claude Code's OTLP metrics
+// export and events from its OTLP logs export (live-only — no backfill).
+// Rows carry the harness session uuid as TEXT; session rows remain owned by
+// the transcript ingesters, so joins go through session.harness_session_id.
+//
+// otel_datapoint dedupe: key = hash(metric, start_ts, all attributes). With
+// cumulative temporality a series re-exports under the same key with a
+// growing value (upsert keeps the latest cumulative total); with delta
+// temporality start_ts advances every export, so each point is its own row.
+// Either way SUM(value) over rows is the true total.
+const schemaV3 = `
+CREATE TABLE otel_datapoint (
+	id                 INTEGER PRIMARY KEY,
+	source_id          INTEGER NOT NULL REFERENCES source(id),
+	harness_session_id TEXT NOT NULL DEFAULT '',
+	metric             TEXT NOT NULL,             -- claude_code.token.usage, ...
+	model              TEXT NOT NULL DEFAULT '',
+	type               TEXT NOT NULL DEFAULT '',  -- token type: input|output|cacheRead|cacheCreation
+	query_source       TEXT NOT NULL DEFAULT '',  -- main | subagent | auxiliary | sdk
+	agent_name         TEXT NOT NULL DEFAULT '',  -- attribution attrs, present when
+	skill_name         TEXT NOT NULL DEFAULT '',  --   the corresponding context is
+	plugin_name        TEXT NOT NULL DEFAULT '',  --   active for the tokens counted
+	mcp_server         TEXT NOT NULL DEFAULT '',
+	mcp_tool           TEXT NOT NULL DEFAULT '',
+	start_ts           TEXT NOT NULL DEFAULT '',
+	ts                 TEXT NOT NULL DEFAULT '',
+	value              REAL NOT NULL DEFAULT 0,
+	attrs              TEXT NOT NULL DEFAULT '{}', -- residual attributes (JSON)
+	dedupe_key         TEXT NOT NULL UNIQUE
+);
+CREATE INDEX idx_otel_dp_metric ON otel_datapoint(metric);
+CREATE INDEX idx_otel_dp_session ON otel_datapoint(harness_session_id);
+
+CREATE TABLE otel_event (
+	id                    INTEGER PRIMARY KEY,
+	source_id             INTEGER NOT NULL REFERENCES source(id),
+	harness_session_id    TEXT NOT NULL DEFAULT '',
+	event                 TEXT NOT NULL,            -- api_request, tool_result, ...
+	ts                    TEXT NOT NULL DEFAULT '',
+	seq                   INTEGER NOT NULL DEFAULT 0, -- event.sequence (per session)
+	prompt_id             TEXT NOT NULL DEFAULT '',
+	request_id            TEXT NOT NULL DEFAULT '',   -- joins request.harness_request_id
+	model                 TEXT NOT NULL DEFAULT '',
+	tool_name             TEXT NOT NULL DEFAULT '',
+	tool_use_id           TEXT NOT NULL DEFAULT '',   -- joins block.tool_use_id
+	query_source          TEXT NOT NULL DEFAULT '',
+	agent_name            TEXT NOT NULL DEFAULT '',
+	skill_name            TEXT NOT NULL DEFAULT '',
+	mcp_server            TEXT NOT NULL DEFAULT '',
+	mcp_tool              TEXT NOT NULL DEFAULT '',
+	duration_ms           INTEGER,
+	input_tokens          INTEGER,
+	output_tokens         INTEGER,
+	cache_read_tokens     INTEGER,
+	cache_creation_tokens INTEGER,
+	cost_usd              REAL,
+	attrs                 TEXT NOT NULL DEFAULT '{}', -- residual attributes (JSON)
+	dedupe_key            TEXT NOT NULL UNIQUE
+);
+CREATE INDEX idx_otel_event_session ON otel_event(harness_session_id);
+CREATE INDEX idx_otel_event_event ON otel_event(event);
+CREATE INDEX idx_otel_event_request ON otel_event(request_id) WHERE request_id != '';
+`
+
+var migrations = []string{schemaV1, schemaV2, schemaV3}
 
 type Store struct {
 	db   *sql.DB
@@ -436,6 +500,102 @@ func (t *Tx) InsertCompaction(c Compaction) error {
 	return err
 }
 
+// --- otel writes ---
+
+type OTelDatapoint struct {
+	SourceID    int64
+	SessionKey  string // harness session uuid from the session.id attribute
+	Metric      string
+	Model       string
+	Type        string
+	QuerySource string
+	AgentName   string
+	SkillName   string
+	PluginName  string
+	MCPServer   string
+	MCPTool     string
+	StartTS     string
+	TS          string
+	Value       float64
+	Attrs       string // residual attributes as JSON
+	DedupeKey   string
+}
+
+// UpsertOTelDatapoint inserts or refreshes a datapoint, returning true when
+// the row is new. A cumulative series re-exports under the same dedupe key
+// with a growing value; last write wins, guarded against out-of-order
+// delivery by the ts comparison.
+func (t *Tx) UpsertOTelDatapoint(d OTelDatapoint) (bool, error) {
+	var exists bool
+	if err := t.tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM otel_datapoint WHERE dedupe_key = ?)`, d.DedupeKey).Scan(&exists); err != nil {
+		return false, err
+	}
+	_, err := t.tx.Exec(`
+		INSERT INTO otel_datapoint (
+			source_id, harness_session_id, metric, model, type, query_source,
+			agent_name, skill_name, plugin_name, mcp_server, mcp_tool,
+			start_ts, ts, value, attrs, dedupe_key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (dedupe_key) DO UPDATE SET
+			ts = excluded.ts,
+			value = excluded.value
+		WHERE excluded.ts >= otel_datapoint.ts`,
+		d.SourceID, d.SessionKey, d.Metric, d.Model, d.Type, d.QuerySource,
+		d.AgentName, d.SkillName, d.PluginName, d.MCPServer, d.MCPTool,
+		d.StartTS, d.TS, d.Value, d.Attrs, d.DedupeKey)
+	return !exists, err
+}
+
+type OTelEvent struct {
+	SourceID            int64
+	SessionKey          string
+	Event               string // event name without the claude_code. prefix
+	TS                  string
+	Seq                 int64
+	PromptID            string
+	RequestID           string
+	Model               string
+	ToolName            string
+	ToolUseID           string
+	QuerySource         string
+	AgentName           string
+	SkillName           string
+	MCPServer           string
+	MCPTool             string
+	DurationMS          *int64
+	InputTokens         *int64
+	OutputTokens        *int64
+	CacheReadTokens     *int64
+	CacheCreationTokens *int64
+	CostUSD             *float64
+	Attrs               string
+	DedupeKey           string
+}
+
+// InsertOTelEvent inserts an event, returning true when the row is new.
+// Events are immutable; a duplicate dedupe key (re-delivered export batch)
+// is a no-op.
+func (t *Tx) InsertOTelEvent(e OTelEvent) (bool, error) {
+	res, err := t.tx.Exec(`
+		INSERT INTO otel_event (
+			source_id, harness_session_id, event, ts, seq, prompt_id, request_id,
+			model, tool_name, tool_use_id, query_source, agent_name, skill_name,
+			mcp_server, mcp_tool, duration_ms, input_tokens, output_tokens,
+			cache_read_tokens, cache_creation_tokens, cost_usd, attrs, dedupe_key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (dedupe_key) DO NOTHING`,
+		e.SourceID, e.SessionKey, e.Event, e.TS, e.Seq, e.PromptID, e.RequestID,
+		e.Model, e.ToolName, e.ToolUseID, e.QuerySource, e.AgentName, e.SkillName,
+		e.MCPServer, e.MCPTool, e.DurationMS, e.InputTokens, e.OutputTokens,
+		e.CacheReadTokens, e.CacheCreationTokens, e.CostUSD, e.Attrs, e.DedupeKey)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 // --- reads ---
 
 type RollupRow struct {
@@ -488,6 +648,7 @@ func (s *Store) Rollup(by, sinceTS string) ([]RollupRow, error) {
 
 type TableCounts struct {
 	Sources, Sessions, Requests, Blocks, Compactions, Files int64
+	OTelDatapoints, OTelEvents                              int64
 }
 
 func (s *Store) Counts() (TableCounts, error) {
@@ -502,6 +663,8 @@ func (s *Store) Counts() (TableCounts, error) {
 		{"block", &c.Blocks},
 		{"compaction", &c.Compactions},
 		{"ingest_file", &c.Files},
+		{"otel_datapoint", &c.OTelDatapoints},
+		{"otel_event", &c.OTelEvents},
 	} {
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM " + q.table).Scan(q.dst); err != nil {
 			return c, err
@@ -761,6 +924,94 @@ type BigBlockRow struct {
 	FilePath  string
 	EstTokens int64
 	TS        string
+}
+
+// --- otel reads ---
+
+// NameValue is a generic (label, numeric total) pair for OTel rollups.
+type NameValue struct {
+	Name  string
+	Value float64
+}
+
+// OTelStatus summarizes captured OTel data for `tokenator otel --status`.
+type OTelStatus struct {
+	Sessions     int64       // distinct harness sessions seen
+	Datapoints   int64       // otel_datapoint rows
+	Events       int64       // otel_event rows
+	TokensByType []NameValue // token.usage totals: input, output, cacheRead, cacheCreation
+	CostUSD      float64     // cost.usage total
+	EventCounts  []NameValue // events by name
+
+	// Cross-check of api_request events against transcript-ingested request
+	// rows, joined on request_id. Sums cover MATCHED pairs only, so the two
+	// sides are directly comparable.
+	APIReqEvents  int64
+	APIReqMatched int64
+	OTelInput     int64
+	OTelOutput    int64
+	JSONLInput    int64
+	JSONLOutput   int64
+}
+
+func (s *Store) OTelStatus() (OTelStatus, error) {
+	var st OTelStatus
+	err := s.db.QueryRow(`
+		SELECT
+			(SELECT COUNT(DISTINCT harness_session_id) FROM otel_datapoint) ,
+			(SELECT COUNT(*) FROM otel_datapoint),
+			(SELECT COUNT(*) FROM otel_event),
+			(SELECT COALESCE(SUM(value), 0) FROM otel_datapoint WHERE metric = 'claude_code.cost.usage')`).
+		Scan(&st.Sessions, &st.Datapoints, &st.Events, &st.CostUSD)
+	if err != nil {
+		return st, err
+	}
+	rows, err := s.db.Query(`
+		SELECT type, SUM(value) FROM otel_datapoint
+		WHERE metric = 'claude_code.token.usage' GROUP BY type ORDER BY SUM(value) DESC`)
+	if err != nil {
+		return st, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nv NameValue
+		if err := rows.Scan(&nv.Name, &nv.Value); err != nil {
+			return st, err
+		}
+		st.TokensByType = append(st.TokensByType, nv)
+	}
+	if err := rows.Err(); err != nil {
+		return st, err
+	}
+	erows, err := s.db.Query(`
+		SELECT event, COUNT(*) FROM otel_event GROUP BY event ORDER BY COUNT(*) DESC`)
+	if err != nil {
+		return st, err
+	}
+	defer erows.Close()
+	for erows.Next() {
+		var nv NameValue
+		if err := erows.Scan(&nv.Name, &nv.Value); err != nil {
+			return st, err
+		}
+		st.EventCounts = append(st.EventCounts, nv)
+	}
+	if err := erows.Err(); err != nil {
+		return st, err
+	}
+	err = s.db.QueryRow(`
+		SELECT COUNT(*),
+			COUNT(r.id),
+			COALESCE(SUM(CASE WHEN r.id IS NOT NULL THEN e.input_tokens END), 0),
+			COALESCE(SUM(CASE WHEN r.id IS NOT NULL THEN e.output_tokens END), 0),
+			COALESCE(SUM(r.input_tokens), 0),
+			COALESCE(SUM(r.output_tokens), 0)
+		FROM otel_event e
+		LEFT JOIN request r ON e.request_id != '' AND r.harness_request_id = e.request_id
+		WHERE e.event = 'api_request'`).
+		Scan(&st.APIReqEvents, &st.APIReqMatched,
+			&st.OTelInput, &st.OTelOutput, &st.JSONLInput, &st.JSONLOutput)
+	return st, err
 }
 
 // BiggestResults lists the largest single tool results — candidates for
