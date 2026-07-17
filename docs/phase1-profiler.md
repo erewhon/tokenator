@@ -94,6 +94,7 @@ compaction  (id, session_id, request_id, kind: auto|manual|microcompact,
 ### Attribution methodology (the hard part)
 
 - **Request-level usage is exact** (harness-reported). Block-level tokens are **estimates**: bytes/4 baseline, better estimator pluggable later.
+- **Two weightings** (implemented): *flow* counts each block once at entry size; *residency* (`attr --residency`) weights by est_tokens × requests the block stayed in context — what cache pricing actually scales with. Residency windows are timestamp-approximated: entry after the block's ts, evicted at the next compact boundary (microcompacts are invisible and overcount slightly), thinking stripped at its turn's end (next user_text). Calibration anchor for residency is metered prompt volume: Σ(input + cache_read + cache_creation) over requests. Real-data flip: flow says meta_text dominates (43%); residency says tool_result + tool_use do (76%, avg ~115 requests resident).
 - **Calibration closes the gap**: per request, `sum(block est_tokens)` vs metered `input_tokens + cache_* fields` yields a session-level correction factor. Report attribution as percentages of metered totals, never as raw estimates — that keeps attribution honest even with a crude estimator.
 - Never call the paid `count_tokens` API from the ingest path.
 
@@ -107,7 +108,7 @@ Without the wire prefix (that's phase 2), infer from usage sequences within a se
 ### Waste heuristics (each independently toggleable, each reported with evidence)
 
 - **Repeat reads**: same `file_content` content_hash entering context >1× in a session.
-- **Stale passengers**: tool_result blocks resident for many requests with no later reference (identifier-overlap heuristic against subsequent assistant/user text; report as "likely", not fact).
+- **Stale passengers**: tool_result blocks resident for many requests with no later reference (identifier-overlap heuristic against subsequent assistant/user text; report as "likely", not fact). *Partially implemented* as `waste`'s long-resident heavyweights: residency cost is computed, but "no later reference" is not — block content is deliberately not stored, so reference detection would need an ingest-time signature (future).
 - **Oversized results**: tool results above a percentile threshold, grouped by tool — the "should rtk handle this?" report.
 - **Schema overhead**: resident tool/MCP schema tokens vs how often each tool was actually called.
 
@@ -116,7 +117,7 @@ Without the wire prefix (that's phase 2), infer from usage sequences within a se
 ```
 tokenator ingest [--watch]        # discover + ingest all sources into ~/.local/share/tokenator/tokenator.db
 tokenator report [--project P] [--since 7d]   # regime-aware rollups incl. cache split
-tokenator attr --by tool|mcp|file|agent|session
+tokenator attr --by tool|mcp|file|agent|session [--residency]
 tokenator session <id>            # TUI: composition timeline ("context flamegraph"),
                                   #   per-request drill-down, compaction markers
 tokenator cache [session]         # cache efficiency score, invalidation events + causes
