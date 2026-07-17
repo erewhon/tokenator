@@ -1,0 +1,436 @@
+// Package store owns the tokenator SQLite database: schema, migrations, and
+// the write/read paths shared by every ingester and report.
+//
+// Design constraints (see docs/phase1-profiler.md):
+//   - request rows hold harness-reported usage and are the ground truth for
+//     spend; anything block-level added later is an estimate layered on top.
+//   - dedupe_key is globally unique across the whole database: the same
+//     Anthropic message can appear in several transcript files (session
+//     resume/fork copies history into new files), and it must be counted once.
+package store
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	_ "modernc.org/sqlite"
+)
+
+const schemaV1 = `
+CREATE TABLE source (
+	id             INTEGER PRIMARY KEY,
+	kind           TEXT NOT NULL,             -- claude_code | opencode | otel | reqlog
+	root           TEXT NOT NULL,             -- filesystem root or DSN
+	billing_regime TEXT NOT NULL DEFAULT 'unknown', -- subscription | metered | local | unknown
+	UNIQUE (kind, root)
+);
+
+CREATE TABLE session (
+	id                 INTEGER PRIMARY KEY,
+	source_id          INTEGER NOT NULL REFERENCES source(id),
+	harness_session_id TEXT NOT NULL,
+	slug               TEXT NOT NULL DEFAULT '',
+	project            TEXT NOT NULL DEFAULT '',  -- display name (basename of cwd)
+	cwd                TEXT NOT NULL DEFAULT '',
+	title              TEXT NOT NULL DEFAULT '',
+	agent              TEXT NOT NULL DEFAULT '',  -- subagent name for sidechain sessions
+	started_at         TEXT NOT NULL DEFAULT '',  -- RFC3339; '' = unknown
+	ended_at           TEXT NOT NULL DEFAULT '',
+	parent_session_id  INTEGER REFERENCES session(id),
+	UNIQUE (source_id, harness_session_id)
+);
+
+CREATE TABLE request (
+	id                       INTEGER PRIMARY KEY,
+	session_id               INTEGER NOT NULL REFERENCES session(id),
+	ts                       TEXT NOT NULL,
+	model                    TEXT NOT NULL DEFAULT '',
+	provider                 TEXT NOT NULL DEFAULT '',
+	input_tokens             INTEGER NOT NULL DEFAULT 0,
+	output_tokens            INTEGER NOT NULL DEFAULT 0,
+	cache_creation_tokens    INTEGER NOT NULL DEFAULT 0,
+	cache_read_tokens        INTEGER NOT NULL DEFAULT 0,
+	cache_creation_5m_tokens INTEGER,                    -- TTL split when reported
+	cache_creation_1h_tokens INTEGER,
+	reasoning_tokens         INTEGER,                    -- OpenCode reports this
+	cost_usd                 REAL,                       -- harness-reported cost, if any
+	finish_reason            TEXT NOT NULL DEFAULT '',
+	speed                    TEXT NOT NULL DEFAULT '',
+	service_tier             TEXT NOT NULL DEFAULT '',
+	dedupe_key               TEXT NOT NULL UNIQUE,
+	harness_msg_id           TEXT NOT NULL DEFAULT '',
+	harness_request_id       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_request_session ON request(session_id);
+CREATE INDEX idx_request_ts ON request(ts);
+
+CREATE TABLE compaction (
+	id         INTEGER PRIMARY KEY,
+	session_id INTEGER NOT NULL REFERENCES session(id),
+	ts         TEXT NOT NULL,
+	cause      TEXT NOT NULL DEFAULT '',  -- auto | manual | microcompact
+	pre_tokens INTEGER,
+	UNIQUE (session_id, ts)
+);
+
+CREATE TABLE ingest_file (
+	id        INTEGER PRIMARY KEY,
+	source_id INTEGER NOT NULL REFERENCES source(id),
+	path      TEXT NOT NULL,
+	size      INTEGER NOT NULL,
+	mtime_ns  INTEGER NOT NULL,
+	UNIQUE (source_id, path)
+);
+`
+
+var migrations = []string{schemaV1}
+
+type Store struct {
+	db   *sql.DB
+	path string
+}
+
+func Open(path string) (*Store, error) {
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create db dir: %w", err)
+		}
+	}
+	dsn := "file:" + path +
+		"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// modernc/sqlite serializes writers anyway; one connection avoids
+	// SQLITE_BUSY between an ingest transaction and report queries.
+	db.SetMaxOpenConns(1)
+	s := &Store{db: db, path: path}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Path() string { return s.path }
+
+func (s *Store) migrate() error {
+	var v int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		return err
+	}
+	for ; v < len(migrations); v++ {
+		if _, err := s.db.Exec(migrations[v]); err != nil {
+			return fmt.Errorf("apply migration %d: %w", v+1, err)
+		}
+		if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", v+1)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) SchemaVersion() (int, error) {
+	var v int
+	err := s.db.QueryRow("PRAGMA user_version").Scan(&v)
+	return v, err
+}
+
+// --- sources ---
+
+func (s *Store) UpsertSource(kind, root, billingRegime string) (int64, error) {
+	var id int64
+	err := s.db.QueryRow(`
+		INSERT INTO source (kind, root, billing_regime) VALUES (?, ?, ?)
+		ON CONFLICT (kind, root) DO UPDATE SET billing_regime = excluded.billing_regime
+		RETURNING id`, kind, root, billingRegime).Scan(&id)
+	return id, err
+}
+
+// --- ingest file bookkeeping ---
+
+// FileUnchanged reports whether path was already ingested at exactly this
+// size and mtime. Any change triggers a full re-parse; global dedupe keys
+// make re-parsing idempotent.
+func (s *Store) FileUnchanged(sourceID int64, path string, size, mtimeNS int64) (bool, error) {
+	var gotSize, gotMtime int64
+	err := s.db.QueryRow(
+		`SELECT size, mtime_ns FROM ingest_file WHERE source_id = ? AND path = ?`,
+		sourceID, path).Scan(&gotSize, &gotMtime)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return gotSize == size && gotMtime == mtimeNS, nil
+}
+
+func (s *Store) RecordFile(sourceID int64, path string, size, mtimeNS int64) error {
+	_, err := s.db.Exec(`
+		INSERT INTO ingest_file (source_id, path, size, mtime_ns) VALUES (?, ?, ?, ?)
+		ON CONFLICT (source_id, path) DO UPDATE SET size = excluded.size, mtime_ns = excluded.mtime_ns`,
+		sourceID, path, size, mtimeNS)
+	return err
+}
+
+type FileState struct {
+	Size    int64
+	MtimeNS int64
+}
+
+// FileStates returns the recorded state of every ingested file for a source
+// in one query — for ingesters that track many small files (OpenCode stores
+// one JSON file per message), where a per-file query would dominate runtime.
+func (s *Store) FileStates(sourceID int64) (map[string]FileState, error) {
+	rows, err := s.db.Query(`SELECT path, size, mtime_ns FROM ingest_file WHERE source_id = ?`, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]FileState{}
+	for rows.Next() {
+		var path string
+		var fs FileState
+		if err := rows.Scan(&path, &fs.Size, &fs.MtimeNS); err != nil {
+			return nil, err
+		}
+		out[path] = fs
+	}
+	return out, rows.Err()
+}
+
+// --- transactional writes ---
+
+type Tx struct{ tx *sql.Tx }
+
+func (s *Store) WithTx(fn func(*Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := fn(&Tx{tx: tx}); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+type Session struct {
+	SourceID  int64
+	HarnessID string
+	Slug      string
+	Project   string
+	CWD       string
+	Title     string
+	Agent     string
+	StartedAt string // RFC3339 or ''
+	EndedAt   string
+}
+
+// UpsertSession merges metadata into an existing session row: non-empty new
+// values win for text fields (titles can change), timestamps widen to the
+// min/max observed.
+func (t *Tx) UpsertSession(sess Session) (int64, error) {
+	var id int64
+	err := t.tx.QueryRow(`
+		INSERT INTO session (source_id, harness_session_id, slug, project, cwd, title, agent, started_at, ended_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (source_id, harness_session_id) DO UPDATE SET
+			slug    = CASE WHEN excluded.slug    != '' THEN excluded.slug    ELSE session.slug    END,
+			project = CASE WHEN excluded.project != '' THEN excluded.project ELSE session.project END,
+			cwd     = CASE WHEN excluded.cwd     != '' THEN excluded.cwd     ELSE session.cwd     END,
+			title   = CASE WHEN excluded.title   != '' THEN excluded.title   ELSE session.title   END,
+			agent   = CASE WHEN excluded.agent   != '' THEN excluded.agent   ELSE session.agent   END,
+			started_at = CASE
+				WHEN session.started_at = '' THEN excluded.started_at
+				WHEN excluded.started_at = '' THEN session.started_at
+				WHEN excluded.started_at < session.started_at THEN excluded.started_at
+				ELSE session.started_at END,
+			ended_at = CASE
+				WHEN session.ended_at = '' THEN excluded.ended_at
+				WHEN excluded.ended_at = '' THEN session.ended_at
+				WHEN excluded.ended_at > session.ended_at THEN excluded.ended_at
+				ELSE session.ended_at END
+		RETURNING id`,
+		sess.SourceID, sess.HarnessID, sess.Slug, sess.Project, sess.CWD,
+		sess.Title, sess.Agent, sess.StartedAt, sess.EndedAt).Scan(&id)
+	return id, err
+}
+
+type Request struct {
+	SessionID           int64
+	TS                  string
+	Model               string
+	Provider            string
+	InputTokens         int64
+	OutputTokens        int64
+	CacheCreationTokens int64
+	CacheReadTokens     int64
+	CacheCreation5m     *int64
+	CacheCreation1h     *int64
+	ReasoningTokens     *int64
+	CostUSD             *float64
+	FinishReason        string
+	Speed               string
+	ServiceTier         string
+	DedupeKey           string
+	HarnessMsgID        string
+	HarnessRequestID    string
+}
+
+// InsertRequest returns true when the row was inserted, false when the
+// dedupe key already existed (duplicate transcript line or re-ingest).
+func (t *Tx) InsertRequest(r Request) (bool, error) {
+	res, err := t.tx.Exec(`
+		INSERT INTO request (
+			session_id, ts, model, provider,
+			input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+			cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_tokens,
+			cost_usd, finish_reason, speed, service_tier,
+			dedupe_key, harness_msg_id, harness_request_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (dedupe_key) DO NOTHING`,
+		r.SessionID, r.TS, r.Model, r.Provider,
+		r.InputTokens, r.OutputTokens, r.CacheCreationTokens, r.CacheReadTokens,
+		r.CacheCreation5m, r.CacheCreation1h, r.ReasoningTokens,
+		r.CostUSD, r.FinishReason, r.Speed, r.ServiceTier,
+		r.DedupeKey, r.HarnessMsgID, r.HarnessRequestID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// UpsertRequest inserts or refreshes a request row by dedupe key, returning
+// true when the row is new. Claude Code transcript lines are immutable, so
+// its ingester uses InsertRequest (first write wins); OpenCode message files
+// mutate in place while a response streams, so usage for an already-seen
+// message can legitimately grow — last write wins here.
+func (t *Tx) UpsertRequest(r Request) (bool, error) {
+	var exists bool
+	if err := t.tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM request WHERE dedupe_key = ?)`, r.DedupeKey).Scan(&exists); err != nil {
+		return false, err
+	}
+	_, err := t.tx.Exec(`
+		INSERT INTO request (
+			session_id, ts, model, provider,
+			input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+			cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_tokens,
+			cost_usd, finish_reason, speed, service_tier,
+			dedupe_key, harness_msg_id, harness_request_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (dedupe_key) DO UPDATE SET
+			ts = excluded.ts,
+			model = excluded.model,
+			provider = excluded.provider,
+			input_tokens = excluded.input_tokens,
+			output_tokens = excluded.output_tokens,
+			cache_creation_tokens = excluded.cache_creation_tokens,
+			cache_read_tokens = excluded.cache_read_tokens,
+			cache_creation_5m_tokens = excluded.cache_creation_5m_tokens,
+			cache_creation_1h_tokens = excluded.cache_creation_1h_tokens,
+			reasoning_tokens = excluded.reasoning_tokens,
+			cost_usd = excluded.cost_usd,
+			finish_reason = excluded.finish_reason`,
+		r.SessionID, r.TS, r.Model, r.Provider,
+		r.InputTokens, r.OutputTokens, r.CacheCreationTokens, r.CacheReadTokens,
+		r.CacheCreation5m, r.CacheCreation1h, r.ReasoningTokens,
+		r.CostUSD, r.FinishReason, r.Speed, r.ServiceTier,
+		r.DedupeKey, r.HarnessMsgID, r.HarnessRequestID)
+	return !exists, err
+}
+
+type Compaction struct {
+	SessionID int64
+	TS        string
+	Cause     string
+	PreTokens *int64
+}
+
+func (t *Tx) InsertCompaction(c Compaction) error {
+	_, err := t.tx.Exec(`
+		INSERT INTO compaction (session_id, ts, cause, pre_tokens) VALUES (?, ?, ?, ?)
+		ON CONFLICT (session_id, ts) DO NOTHING`,
+		c.SessionID, c.TS, c.Cause, c.PreTokens)
+	return err
+}
+
+// --- reads ---
+
+type RollupRow struct {
+	Group       string
+	Requests    int64
+	Input       int64
+	Output      int64
+	CacheRead   int64
+	CacheCreate int64
+}
+
+var rollupGroups = map[string]string{
+	"project": `COALESCE(NULLIF(s.project, ''), '(unknown)')`,
+	"model":   `COALESCE(NULLIF(r.model, ''), '(unknown)')`,
+	"session": `s.harness_session_id || CASE WHEN s.title != '' THEN ' — ' || s.title ELSE '' END`,
+}
+
+// Rollup aggregates request usage grouped by project, model, or session.
+// sinceTS is an RFC3339 lower bound; empty means all time.
+func (s *Store) Rollup(by, sinceTS string) ([]RollupRow, error) {
+	groupExpr, ok := rollupGroups[by]
+	if !ok {
+		return nil, fmt.Errorf("unknown rollup group %q (want project, model, or session)", by)
+	}
+	rows, err := s.db.Query(`
+		SELECT `+groupExpr+` AS grp,
+			COUNT(*),
+			SUM(r.input_tokens), SUM(r.output_tokens),
+			SUM(r.cache_read_tokens), SUM(r.cache_creation_tokens)
+		FROM request r
+		JOIN session s ON s.id = r.session_id
+		WHERE (? = '' OR r.ts >= ?)
+		GROUP BY grp
+		ORDER BY SUM(r.input_tokens + r.output_tokens + r.cache_read_tokens + r.cache_creation_tokens) DESC`,
+		sinceTS, sinceTS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RollupRow
+	for rows.Next() {
+		var r RollupRow
+		if err := rows.Scan(&r.Group, &r.Requests, &r.Input, &r.Output, &r.CacheRead, &r.CacheCreate); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+type TableCounts struct {
+	Sources, Sessions, Requests, Compactions, Files int64
+}
+
+func (s *Store) Counts() (TableCounts, error) {
+	var c TableCounts
+	for _, q := range []struct {
+		table string
+		dst   *int64
+	}{
+		{"source", &c.Sources},
+		{"session", &c.Sessions},
+		{"request", &c.Requests},
+		{"compaction", &c.Compactions},
+		{"ingest_file", &c.Files},
+	} {
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM " + q.table).Scan(q.dst); err != nil {
+			return c, err
+		}
+	}
+	return c, nil
+}
