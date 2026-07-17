@@ -109,7 +109,7 @@ func TestBlockAttribution(t *testing.T) {
 
 	// By kind: full composition of extracted blocks.
 	kinds := map[string][2]int64{} // kind -> {blocks, est}
-	kindRows, err := st.AttrRollup("kind", "")
+	kindRows, err := st.AttrRollup("kind", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestBlockAttribution(t *testing.T) {
 	}
 
 	// By tool: results resolve to the tool that requested them.
-	toolRows, err := st.AttrRollup("tool", "")
+	toolRows, err := st.AttrRollup("tool", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestBlockAttribution(t *testing.T) {
 	}
 
 	// By file: Read result attributed to its path (via tool_use input).
-	fileRows, err := st.AttrRollup("file", "")
+	fileRows, err := st.AttrRollup("file", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
