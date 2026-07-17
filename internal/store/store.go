@@ -634,6 +634,76 @@ func (s *Store) RepeatReads(sinceTS string, limit int) ([]RepeatReadRow, error) 
 	return out, rows.Err()
 }
 
+// --- cache analysis inputs ---
+
+// CacheReq feeds the analyzer (internal/analyze). Rows are ordered by
+// (session_id, ts) as the analyzer requires.
+type CacheReq struct {
+	SessionID  int64
+	Project    string
+	SessionKey string
+	Title      string
+	TS         string
+	Model      string
+	Input      int64
+	Output     int64
+	CacheRead  int64
+	CacheWrite int64
+	Write5m    *int64
+	Write1h    *int64
+}
+
+// RequestsForCache returns analyzer input. The since filter is applied at
+// SESSION granularity (a session is included whole when any of its requests
+// falls in the window) — cutting a session mid-way would fabricate a cold
+// start. sessionPrefix narrows to sessions whose harness id or slug starts
+// with the prefix; empty matches all.
+func (s *Store) RequestsForCache(sinceTS, sessionPrefix string) ([]CacheReq, error) {
+	rows, err := s.db.Query(`
+		SELECT r.session_id, s.project, s.harness_session_id, s.title, r.ts, r.model,
+			r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens,
+			r.cache_creation_5m_tokens, r.cache_creation_1h_tokens
+		FROM request r
+		JOIN session s ON s.id = r.session_id
+		WHERE (? = '' OR r.session_id IN (SELECT DISTINCT session_id FROM request WHERE ts >= ?))
+		  AND (? = '' OR s.harness_session_id LIKE ? || '%' OR s.slug LIKE ? || '%')
+		ORDER BY r.session_id, r.ts`,
+		sinceTS, sinceTS, sessionPrefix, sessionPrefix, sessionPrefix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CacheReq
+	for rows.Next() {
+		var r CacheReq
+		if err := rows.Scan(&r.SessionID, &r.Project, &r.SessionKey, &r.Title, &r.TS, &r.Model,
+			&r.Input, &r.Output, &r.CacheRead, &r.CacheWrite, &r.Write5m, &r.Write1h); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CompactionTimes maps session id to its compact-boundary timestamps.
+func (s *Store) CompactionTimes() (map[int64][]string, error) {
+	rows, err := s.db.Query(`SELECT session_id, ts FROM compaction ORDER BY session_id, ts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64][]string{}
+	for rows.Next() {
+		var id int64
+		var ts string
+		if err := rows.Scan(&id, &ts); err != nil {
+			return nil, err
+		}
+		out[id] = append(out[id], ts)
+	}
+	return out, rows.Err()
+}
+
 type BigBlockRow struct {
 	Project   string
 	Tool      string

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/erewhon/tokenator/internal/analyze"
 	"github.com/erewhon/tokenator/internal/ingest/claudecode"
 	"github.com/erewhon/tokenator/internal/ingest/opencode"
 	"github.com/erewhon/tokenator/internal/report"
@@ -35,6 +36,8 @@ func main() {
 		err = cmdAttr(os.Args[2:])
 	case "waste":
 		err = cmdWaste(os.Args[2:])
+	case "cache":
+		err = cmdCache(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "-h", "--help", "help":
@@ -57,6 +60,7 @@ commands:
   report    usage rollups with cache splits (--by project|model|session)
   attr      block-level attribution (--by tool|mcp|file|kind)
   waste     repeat reads and oversized tool results
+  cache     cache doctor: invalidation events, causes, reuse scores
   doctor    show database and source status
 
 common flags:
@@ -219,6 +223,53 @@ func cmdWaste(args []string) error {
 		return err
 	}
 	return report.RenderWaste(os.Stdout, reads, big)
+}
+
+func cmdCache(args []string) error {
+	fs := flag.NewFlagSet("cache", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDBPath(), "database path")
+	since := fs.String("since", "", "window like 7d, 24h (default: all time; applied per session)")
+	limit := fs.Int("limit", 10, "worst sessions to list")
+	session := fs.String("session", "", "session id or slug prefix: per-request drill-down")
+	fs.Parse(args)
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	sinceTS, err := parseSince(*since)
+	if err != nil {
+		return err
+	}
+	reqs, err := st.RequestsForCache(sinceTS, *session)
+	if err != nil {
+		return err
+	}
+	if len(reqs) == 0 {
+		log.Print("no matching requests — run `tokenator ingest` first")
+		return nil
+	}
+	comps, err := st.CompactionTimes()
+	if err != nil {
+		return err
+	}
+	aReqs := make([]analyze.Req, len(reqs))
+	for i, r := range reqs {
+		aReqs[i] = analyze.Req{
+			SessionID: r.SessionID, Project: r.Project, SessionKey: r.SessionKey,
+			Title: r.Title, TS: r.TS, Model: r.Model,
+			Input: r.Input, Output: r.Output,
+			CacheRead: r.CacheRead, CacheWrite: r.CacheWrite,
+			Write5m: r.Write5m, Write1h: r.Write1h,
+		}
+	}
+	rep := analyze.Cache(aReqs, comps)
+	if *session != "" {
+		return report.RenderCacheSession(os.Stdout, aReqs, rep)
+	}
+	return report.RenderCacheSummary(os.Stdout, rep, *limit)
 }
 
 func cmdDoctor(args []string) error {
