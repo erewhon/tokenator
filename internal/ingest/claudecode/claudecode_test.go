@@ -54,8 +54,8 @@ func TestIngestFixture(t *testing.T) {
 	if stats.Requests != 3 {
 		t.Errorf("requests inserted: got %d, want 3", stats.Requests)
 	}
-	if stats.Duplicates != 2 {
-		t.Errorf("duplicates: got %d, want 2 (repeated content-block lines for msg_A and msg_B)", stats.Duplicates)
+	if stats.Duplicates != 4 {
+		t.Errorf("duplicates: got %d, want 4 (repeated content-block lines for msg_A, msg_B, msg_C)", stats.Duplicates)
 	}
 	if stats.Synthetic != 1 {
 		t.Errorf("synthetic: got %d, want 1", stats.Synthetic)
@@ -69,8 +69,8 @@ func TestIngestFixture(t *testing.T) {
 	if stats.ParseErrors != 0 {
 		t.Errorf("parse errors: got %d, want 0", stats.ParseErrors)
 	}
-	if stats.Blocks != 10 {
-		t.Errorf("blocks: got %d, want 10 (2 user_text, 1 meta_text, 2 assistant_text, 1 thinking, 2 tool_use, 2 tool_result)", stats.Blocks)
+	if stats.Blocks != 14 {
+		t.Errorf("blocks: got %d, want 14 (2 user_text, 1 meta_text, 3 assistant_text, 1 thinking, 3 tool_use, 4 tool_result)", stats.Blocks)
 	}
 
 	rows, err := st.Rollup("project", "")
@@ -117,8 +117,8 @@ func TestBlockAttribution(t *testing.T) {
 		kinds[r.Group] = [2]int64{r.Blocks, r.EstTokens}
 	}
 	for kind, wantBlocks := range map[string]int64{
-		"user_text": 2, "meta_text": 1, "assistant_text": 2,
-		"thinking": 1, "tool_use": 2, "tool_result": 2,
+		"user_text": 2, "meta_text": 1, "assistant_text": 3,
+		"thinking": 1, "tool_use": 3, "tool_result": 4,
 	} {
 		if kinds[kind][0] != wantBlocks {
 			t.Errorf("kind %s: got %d blocks, want %d", kind, kinds[kind][0], wantBlocks)
@@ -138,8 +138,8 @@ func TestBlockAttribution(t *testing.T) {
 	for _, r := range toolRows {
 		tools[r.Group] = r.Blocks
 	}
-	if tools["Bash"] != 1 || tools["Read"] != 1 {
-		t.Errorf("tool attribution: got %v, want Bash=1 Read=1", tools)
+	if tools["Bash"] != 1 || tools["Read"] != 1 || tools["Grep"] != 1 {
+		t.Errorf("tool attribution: got %v, want Bash=1 Read=1 Grep=1", tools)
 	}
 
 	// By file: Read result attributed to its path (via tool_use input).
@@ -193,11 +193,11 @@ func TestIngestIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Requests != 0 || stats.Duplicates != 5 {
-		t.Errorf("touched rerun: got requests=%d dup=%d, want 0/5", stats.Requests, stats.Duplicates)
+	if stats.Requests != 0 || stats.Duplicates != 7 {
+		t.Errorf("touched rerun: got requests=%d dup=%d, want 0/7", stats.Requests, stats.Duplicates)
 	}
-	if stats.Blocks != 0 || stats.BlocksUpdated != 10 {
-		t.Errorf("touched rerun blocks: got +%d/%d updated, want 0/10", stats.Blocks, stats.BlocksUpdated)
+	if stats.Blocks != 0 || stats.BlocksUpdated != 14 {
+		t.Errorf("touched rerun blocks: got +%d/%d updated, want 0/14", stats.Blocks, stats.BlocksUpdated)
 	}
 
 	rows, err := st.Rollup("project", "")
@@ -206,5 +206,64 @@ func TestIngestIdempotent(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Requests != 3 || rows[0].Input != 35 {
 		t.Errorf("totals drifted after re-ingest: %+v", rows)
+	}
+}
+
+func TestReferenceDetection(t *testing.T) {
+	st := testStore(t)
+	root := copyFixture(t)
+	ing := &Ingester{Root: root}
+
+	stats, err := ing.Run(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Grep result is cited by later assistant text (parseConfig +
+	// src/config_loader.go); the toolu_stale result never is. Bash ("ok
+	// done") and Read ("package main...") yield no distinctive identifiers
+	// and must stay unknown, not be miscalled stale.
+	if stats.RefsFound != 1 || stats.RefsMissing != 1 {
+		t.Errorf("refs: got %d found / %d missing, want 1/1", stats.RefsFound, stats.RefsMissing)
+	}
+
+	verdicts := map[string]int64{}
+	blocks, err := st.BlocksForResidency("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range blocks {
+		if b.Kind == "tool_result" {
+			verdicts[b.Tool] = b.Referenced
+		}
+	}
+	want := map[string]int64{
+		"Grep": store.RefReferenced,
+		"":     store.RefUnreferenced, // toolu_stale has no tool_use to resolve against
+		"Bash": store.RefUnknown,
+		"Read": store.RefUnknown,
+	}
+	for tool, wantRef := range want {
+		if verdicts[tool] != wantRef {
+			t.Errorf("tool %q verdict = %d, want %d", tool, verdicts[tool], wantRef)
+		}
+	}
+
+	// Verdicts survive a re-ingest (merge keeps known states).
+	path := filepath.Join(root, "-home-user-proj", "11111111-1111-1111-1111-111111111111.jsonl")
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ing.Run(st); err != nil {
+		t.Fatal(err)
+	}
+	blocks, err = st.BlocksForResidency("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range blocks {
+		if b.Kind == "tool_result" && b.Tool == "Grep" && b.Referenced != store.RefReferenced {
+			t.Errorf("Grep verdict lost on re-ingest: %d", b.Referenced)
+		}
 	}
 }
