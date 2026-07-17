@@ -4,18 +4,22 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/erewhon/tokenator/internal/analyze"
 	"github.com/erewhon/tokenator/internal/ingest/claudecode"
 	"github.com/erewhon/tokenator/internal/ingest/opencode"
+	"github.com/erewhon/tokenator/internal/ingest/otel"
 	"github.com/erewhon/tokenator/internal/report"
 	"github.com/erewhon/tokenator/internal/store"
 )
@@ -40,6 +44,8 @@ func main() {
 		err = cmdCache(os.Args[2:])
 	case "session":
 		err = cmdSession(os.Args[2:])
+	case "otel":
+		err = cmdOTel(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "-h", "--help", "help":
@@ -65,6 +71,7 @@ commands:
   cache     cache doctor: invalidation events, causes, reuse scores
   session   single-session view: timeline, composition, events
             (session <id-or-slug-prefix> [--html out.html])
+  otel      OTLP/HTTP receiver for Claude Code telemetry (--status for summary)
   doctor    show database and source status
 
 common flags:
@@ -316,6 +323,43 @@ func cmdSession(args []string) error {
 	return report.RenderSessionTerm(os.Stdout, view)
 }
 
+func cmdOTel(args []string) error {
+	fs := flag.NewFlagSet("otel", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDBPath(), "database path")
+	listen := fs.String("listen", otel.DefaultAddr, "OTLP/HTTP listen address")
+	regime := fs.String("regime", "subscription", "billing regime for the otel source: subscription|metered")
+	status := fs.Bool("status", false, "print captured-data summary and cross-check, then exit")
+	fs.Parse(args)
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	if *status {
+		s, err := st.OTelStatus()
+		if err != nil {
+			return err
+		}
+		return report.RenderOTelStatus(os.Stdout, s)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	rc := &otel.Receiver{Addr: *listen, Regime: *regime, Store: st}
+	log.Printf("OTLP/HTTP JSON receiver on http://%s (POST /v1/metrics, /v1/logs; traces accepted and dropped)", *listen)
+	log.Printf(`point Claude Code here — e.g. in ~/.claude/settings.json "env", or exported in your shell:
+  CLAUDE_CODE_ENABLE_TELEMETRY=1
+  OTEL_METRICS_EXPORTER=otlp
+  OTEL_LOGS_EXPORTER=otlp
+  OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://%s
+(Ctrl-C to stop; `+"`tokenator otel --status`"+` for a capture summary)`, *listen)
+	return rc.Run(ctx)
+}
+
 func cmdDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDBPath(), "database path")
@@ -341,6 +385,9 @@ func cmdDoctor(args []string) error {
 	fmt.Printf("requests:    %d\n", counts.Requests)
 	fmt.Printf("compactions: %d\n", counts.Compactions)
 	fmt.Printf("files seen:  %d\n", counts.Files)
+	if counts.OTelDatapoints > 0 || counts.OTelEvents > 0 {
+		fmt.Printf("otel:        %d datapoints, %d events\n", counts.OTelDatapoints, counts.OTelEvents)
+	}
 
 	home, err := os.UserHomeDir()
 	if err == nil {

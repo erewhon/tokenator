@@ -1,6 +1,6 @@
 # Tokenator Phase 1 — the profiler
 
-Status: design sketch (2026-07-16). Nothing here is implemented yet.
+Status: design sketch (2026-07-16). M1–M4 and the OTel receiver are implemented; details below that were "to verify" are annotated where reality differed.
 
 ## Purpose
 
@@ -52,9 +52,15 @@ To verify during implementation (schema drifts by CC version; ingest must be len
 
 OpenCode computes `cost` itself (models.dev pricing; known-broken for custom providers) — record it but recompute our own.
 
-### 3. Claude Code OTel (optional, later in phase 1)
+### 3. Claude Code OTel (implemented — `tokenator otel`)
 
-`claude_code.token.usage` metrics carry per-`tool`, per-`mcp_server`, per-`skill`, per-`agent` attribution that transcripts only yield by inference. An OTLP receiver is the cleanest way to get harness-blessed attribution — but it's live-only (no backfill), so it complements rather than replaces JSONL ingest.
+An OTLP/HTTP **JSON-only** receiver (`internal/ingest/otel`): gRPC/protobuf would each add a dependency tree for data encoding/json already reads, and the user is setting OTel env vars anyway (`OTEL_EXPORTER_OTLP_PROTOCOL=http/json`). Live-only (no backfill), so it complements rather than replaces JSONL ingest; sessions/requests stay owned by the transcript ingesters and OTel rows join via session uuid and `request_id`.
+
+Verified against CC 2.1.212 (console-exporter probe + live OTLP run) and current docs:
+
+- **Metrics** → `otel_datapoint`: `claude_code.{session.count, token.usage, cost.usage, active_time.total, lines_of_code.count, ...}`. `token.usage`/`cost.usage` carry `model`, `type` (input|output|cacheRead|cacheCreation), `query_source`, and — only while the context is active — `agent.name`/`skill.name`/`plugin.name`/`mcp_server.name`/`mcp_tool.name` attribution (promoted to columns).
+- **Events** (log records, body `claude_code.<name>`) → `otel_event`: `api_request` carries `request_id` + per-request tokens + **`cost_usd` + `duration_ms`** (neither exists in transcripts); `tool_result`/`tool_decision` carry `tool_name` + `tool_use_id` (joins `block.tool_use_id`); plus hook/MCP-connection/compaction/api_error events. `request_id` matches transcript `requestId` — live validation cross-checked 100% of api_request events against ingested request rows with identical token sums (`tokenator otel --status`).
+- Dedupe makes temporality a non-issue: datapoint key = hash(metric, start_ts, attrs) — cumulative series update one row in place, delta series land as new rows; SUM(value) is correct either way.
 
 ### 4. Router reqlog (optional)
 
@@ -116,6 +122,7 @@ tokenator session <id>            # TUI: composition timeline ("context flamegra
 tokenator cache [session]         # cache efficiency score, invalidation events + causes
 tokenator waste [--project P]     # the four heuristics, with evidence
 tokenator export --html out/      # self-contained HTML (shareable / video-friendly)
+tokenator otel [--listen ADDR]    # OTLP/HTTP JSON receiver; --status = capture summary
 tokenator doctor                  # source discovery + schema-drift sanity checks
 ```
 
@@ -127,7 +134,7 @@ internal/store/        # sqlite (modernc.org/sqlite — pure Go, single static b
 internal/ingest/       # Source interface: Discover() / Backfill() / Watch()
 internal/ingest/claudecode/
 internal/ingest/opencode/
-internal/ingest/otel/  # later
+internal/ingest/otel/  # OTLP/HTTP JSON receiver (tokenator otel)
 internal/ingest/reqlog/
 internal/estimate/     # token estimator + calibration
 internal/analyze/      # composition, cache, waste, attribution

@@ -175,6 +175,57 @@ func RenderCacheSession(w io.Writer, reqs []analyze.Req, rep *analyze.CacheRepor
 	return tw.Flush()
 }
 
+// RenderOTelStatus writes the OTel capture summary plus the api_request
+// cross-check against transcript-ingested request rows.
+func RenderOTelStatus(w io.Writer, st store.OTelStatus) error {
+	if st.Datapoints == 0 && st.Events == 0 {
+		fmt.Fprintf(w, "no OTel data captured — run `tokenator otel` and point Claude Code at it\n")
+		return nil
+	}
+	fmt.Fprintf(w, "OTEL CAPTURE (live receiver data)\n")
+	fmt.Fprintf(w, "sessions: %s   datapoints: %s   events: %s\n",
+		comma(st.Sessions), comma(st.Datapoints), comma(st.Events))
+
+	if len(st.TokensByType) > 0 {
+		fmt.Fprintf(w, "\n")
+		tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+		fmt.Fprintf(tw, "TOKENS (claude_code.token.usage)\t\n")
+		for _, nv := range st.TokensByType {
+			fmt.Fprintf(tw, "%s\t%s\n", nv.Name, comma(int64(nv.Value)))
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+	}
+	if st.CostUSD > 0 {
+		fmt.Fprintf(w, "reported cost: $%.4f\n", st.CostUSD)
+	}
+
+	if len(st.EventCounts) > 0 {
+		fmt.Fprintf(w, "\n")
+		tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+		fmt.Fprintf(tw, "EVENT\tCOUNT\n")
+		for _, nv := range st.EventCounts {
+			fmt.Fprintf(tw, "%s\t%s\n", nv.Name, comma(int64(nv.Value)))
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+	}
+
+	if st.APIReqEvents > 0 {
+		fmt.Fprintf(w, "\nCROSS-CHECK (api_request events vs transcript-ingested requests, by request_id)\n")
+		fmt.Fprintf(w, "events: %s   matched: %s (%s)\n",
+			comma(st.APIReqEvents), comma(st.APIReqMatched), pct(st.APIReqMatched, st.APIReqEvents))
+		if st.APIReqMatched > 0 {
+			fmt.Fprintf(w, "matched input tokens: otel %s vs transcript %s   output: otel %s vs transcript %s\n",
+				comma(st.OTelInput), comma(st.JSONLInput), comma(st.OTelOutput), comma(st.JSONLOutput))
+		}
+		fmt.Fprintf(w, "(unmatched events are normal: auxiliary calls like title generation never land in transcripts,\n and transcripts need a fresh `tokenator ingest` to be current)\n")
+	}
+	return nil
+}
+
 func headerFor(by string) string {
 	switch by {
 	case "model":
