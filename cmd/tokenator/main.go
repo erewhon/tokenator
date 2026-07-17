@@ -31,6 +31,10 @@ func main() {
 		err = cmdIngest(os.Args[2:])
 	case "report":
 		err = cmdReport(os.Args[2:])
+	case "attr":
+		err = cmdAttr(os.Args[2:])
+	case "waste":
+		err = cmdWaste(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "-h", "--help", "help":
@@ -49,8 +53,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage: tokenator <command> [flags]
 
 commands:
-  ingest    ingest harness data (Claude Code transcripts) into the database
+  ingest    ingest harness data (Claude Code + OpenCode) into the database
   report    usage rollups with cache splits (--by project|model|session)
+  attr      block-level attribution (--by tool|mcp|file|kind)
+  waste     repeat reads and oversized tool results
   doctor    show database and source status
 
 common flags:
@@ -75,6 +81,7 @@ func cmdIngest(args []string) error {
 	claudeRoot := fs.String("claude-root", "", "Claude Code projects dir (default ~/.claude/projects)")
 	opencodeRoot := fs.String("opencode-root", "", "OpenCode storage dir (default ~/.local/share/opencode/storage)")
 	regime := fs.String("regime", "subscription", "billing regime for the Claude Code source: subscription|metered")
+	full := fs.Bool("full", false, "re-parse all files even if unchanged (needed once after schema upgrades)")
 	fs.Parse(args)
 
 	st, err := store.Open(*dbPath)
@@ -83,7 +90,7 @@ func cmdIngest(args []string) error {
 	}
 	defer st.Close()
 
-	cc := &claudecode.Ingester{Root: *claudeRoot, Regime: *regime}
+	cc := &claudecode.Ingester{Root: *claudeRoot, Regime: *regime, Full: *full}
 	start := time.Now()
 	ccStats, err := cc.Run(st)
 	if err != nil {
@@ -91,7 +98,7 @@ func cmdIngest(args []string) error {
 	}
 	log.Printf("claude_code: %s (%.1fs)", ccStats, time.Since(start).Seconds())
 
-	oc := &opencode.Ingester{Root: *opencodeRoot}
+	oc := &opencode.Ingester{Root: *opencodeRoot, Full: *full}
 	if root, err := ocRootOrSkip(oc); err == nil && root != "" {
 		start = time.Now()
 		ocStats, err := oc.Run(st)
@@ -152,6 +159,66 @@ func cmdReport(args []string) error {
 		return nil
 	}
 	return report.Render(os.Stdout, *by, rows)
+}
+
+func cmdAttr(args []string) error {
+	fs := flag.NewFlagSet("attr", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDBPath(), "database path")
+	by := fs.String("by", "tool", "group by: tool|mcp|file|kind")
+	since := fs.String("since", "", "window like 7d, 24h (default: all time)")
+	fs.Parse(args)
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	sinceTS, err := parseSince(*since)
+	if err != nil {
+		return err
+	}
+	rows, err := st.AttrRollup(*by, sinceTS)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		log.Print("no blocks — run `tokenator ingest` (add --full once after upgrading)")
+		return nil
+	}
+	cal, err := st.Calibrate(sinceTS)
+	if err != nil {
+		return err
+	}
+	return report.RenderAttr(os.Stdout, *by, rows, cal)
+}
+
+func cmdWaste(args []string) error {
+	fs := flag.NewFlagSet("waste", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDBPath(), "database path")
+	since := fs.String("since", "", "window like 7d, 24h (default: all time)")
+	limit := fs.Int("limit", 15, "rows per table")
+	fs.Parse(args)
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	sinceTS, err := parseSince(*since)
+	if err != nil {
+		return err
+	}
+	reads, err := st.RepeatReads(sinceTS, *limit)
+	if err != nil {
+		return err
+	}
+	big, err := st.BiggestResults(sinceTS, *limit)
+	if err != nil {
+		return err
+	}
+	return report.RenderWaste(os.Stdout, reads, big)
 }
 
 func cmdDoctor(args []string) error {
