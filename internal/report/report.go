@@ -332,6 +332,43 @@ func cachedPct(r store.RollupRow) string {
 	return fmt.Sprintf("%.1f%%", 100*float64(r.CacheRead)/float64(prompt))
 }
 
+// RenderGwStatus writes the gateway (reqlog) capture summary: what the
+// router saw on the wire, and how much of it paired with transcript rows.
+func RenderGwStatus(w io.Writer, st store.GwStatus) error {
+	if st.Rows == 0 {
+		fmt.Fprintf(w, "no gateway data — run `tokenator reqlog` with a DSN first\n")
+		return nil
+	}
+	fmt.Fprintf(w, "GATEWAY CAPTURE (router reqlog)\n")
+	fmt.Fprintf(w, "rows: %s   window: %s → %s\n", comma(st.Rows), st.MinTS, st.MaxTS)
+
+	fmt.Fprintf(w, "\n")
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "API CLASS\tROWS\n")
+	for _, nv := range st.ByClass {
+		fmt.Fprintf(tw, "%s\t%s\n", nv.Name, comma(int64(nv.Value)))
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	if st.AnthRows > 0 {
+		fmt.Fprintf(w, "\nANTHROPIC PASSTHROUGH\n")
+		tw = tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+		fmt.Fprintf(tw, "input\t%s\n", comma(st.AnthInput))
+		fmt.Fprintf(tw, "output\t%s\n", comma(st.AnthOutput))
+		fmt.Fprintf(tw, "cache read\t%s\n", comma(st.AnthCacheRead))
+		fmt.Fprintf(tw, "cache write\t%s\n", comma(st.AnthCacheCreate))
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+		fmt.Fprintf(w, "matched to transcripts: %s of %s usage-bearing rows (%s)\n",
+			comma(st.AnthMatched), comma(st.AnthUsage), pct(st.AnthMatched, st.AnthUsage))
+		fmt.Fprintf(w, "longest prefix hash chain: %s segments\n", comma(st.ChainMax))
+	}
+	return nil
+}
+
 func comma(n int64) string {
 	s := strconv.FormatInt(n, 10)
 	if len(s) <= 3 {

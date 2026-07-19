@@ -20,6 +20,7 @@ import (
 	"github.com/erewhon/tokenator/internal/ingest/claudecode"
 	"github.com/erewhon/tokenator/internal/ingest/opencode"
 	"github.com/erewhon/tokenator/internal/ingest/otel"
+	"github.com/erewhon/tokenator/internal/ingest/reqlog"
 	"github.com/erewhon/tokenator/internal/report"
 	"github.com/erewhon/tokenator/internal/store"
 )
@@ -46,6 +47,8 @@ func main() {
 		err = cmdSession(os.Args[2:])
 	case "otel":
 		err = cmdOTel(os.Args[2:])
+	case "reqlog":
+		err = cmdReqlog(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "-h", "--help", "help":
@@ -73,6 +76,8 @@ commands:
   session   single-session view: timeline, composition, events
             (session <id-or-slug-prefix> [--html out.html])
   otel      OTLP/HTTP receiver for Claude Code telemetry (--status for summary)
+  reqlog    pull gateway request rows from the LLM router's reqlog Postgres
+            (--dsn or $TOKENATOR_REQLOG_DSN; --status for summary)
   doctor    show database and source status
 
 common flags:
@@ -124,6 +129,13 @@ func cmdIngest(args []string) error {
 		log.Printf("opencode: %s (%.1fs)", ocStats, time.Since(start).Seconds())
 	} else {
 		log.Print("opencode: storage dir not found, skipping")
+	}
+
+	// New transcript rows may pair with already-captured gateway rows.
+	if matched, _, err := st.MatchGwRequests(); err != nil {
+		return err
+	} else if matched > 0 {
+		log.Printf("reqlog: matched %d gateway rows to new transcript requests", matched)
 	}
 	return nil
 }
@@ -420,6 +432,52 @@ func cmdOTel(args []string) error {
 	return rc.Run(ctx)
 }
 
+func cmdReqlog(args []string) error {
+	fs := flag.NewFlagSet("reqlog", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDBPath(), "database path")
+	dsn := fs.String("dsn", os.Getenv("TOKENATOR_REQLOG_DSN"),
+		"reqlog Postgres DSN, URI form (default $TOKENATOR_REQLOG_DSN)")
+	regime := fs.String("regime", "subscription",
+		"billing regime for this source: subscription|metered|local|unknown")
+	status := fs.Bool("status", false, "print captured-data summary, then exit")
+	fs.Parse(args)
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	if *status {
+		gs, err := st.GwStatus()
+		if err != nil {
+			return err
+		}
+		return report.RenderGwStatus(os.Stdout, gs)
+	}
+
+	if *dsn == "" {
+		return fmt.Errorf(`no DSN: set --dsn or TOKENATOR_REQLOG_DSN, e.g.
+  postgres://router:$(ho secret get llm-router/reqlog-pg-password)@euclid.m.bcc.sh:5433/router`)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	src, err := reqlog.OpenPG(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	ing := &reqlog.Ingester{Src: src, Regime: *regime}
+	start := time.Now()
+	stats, err := ing.Run(ctx, st)
+	if err != nil {
+		return err
+	}
+	log.Printf("reqlog %s: %s (%.1fs)", src.Root(), stats, time.Since(start).Seconds())
+	return nil
+}
+
 func cmdDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDBPath(), "database path")
@@ -447,6 +505,9 @@ func cmdDoctor(args []string) error {
 	fmt.Printf("files seen:  %d\n", counts.Files)
 	if counts.OTelDatapoints > 0 || counts.OTelEvents > 0 {
 		fmt.Printf("otel:        %d datapoints, %d events\n", counts.OTelDatapoints, counts.OTelEvents)
+	}
+	if counts.GwRequests > 0 {
+		fmt.Printf("gateway:     %d reqlog rows\n", counts.GwRequests)
 	}
 
 	home, err := os.UserHomeDir()
