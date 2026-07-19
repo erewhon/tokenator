@@ -187,7 +187,48 @@ ALTER TABLE block ADD COLUMN referenced INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE block ADD COLUMN first_ref_ts TEXT NOT NULL DEFAULT '';
 `
 
-var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4}
+// schemaV5 adds gateway capture: request rows pulled from the LLM router's
+// reqlog Postgres (router_requests), one row per request that crossed the
+// router — including the Anthropic passthrough Claude Code reaches via
+// ANTHROPIC_BASE_URL. Wire-observed usage plus the prefix hash chain (rolling
+// per-segment digests of the rendered prompt in cache order; hashes only,
+// content never leaves the router). request_key links a row to the transcript
+// request it paired with; the router never sees harness session ids, so the
+// pairing is inferred (see MatchGwRequests).
+const schemaV5 = `
+CREATE TABLE gw_request (
+	id                    INTEGER PRIMARY KEY,
+	source_id             INTEGER NOT NULL REFERENCES source(id),
+	pg_id                 INTEGER NOT NULL,          -- router_requests.id on the origin Postgres
+	router_req_id         TEXT NOT NULL DEFAULT '',  -- router-generated X-Request-ID
+	ts                    TEXT NOT NULL,
+	method                TEXT NOT NULL DEFAULT '',
+	path                  TEXT NOT NULL DEFAULT '',
+	model                 TEXT NOT NULL DEFAULT '',  -- as the caller sent
+	backend_model         TEXT NOT NULL DEFAULT '',  -- rewritten model ('' for passthrough)
+	backend_url           TEXT NOT NULL DEFAULT '',
+	resolved_via          TEXT NOT NULL DEFAULT '',
+	api_class             TEXT NOT NULL DEFAULT '',
+	via_tool_proxy        INTEGER NOT NULL DEFAULT 0,
+	stream                INTEGER NOT NULL DEFAULT 0,
+	status                INTEGER NOT NULL DEFAULT 0,
+	latency_ms            INTEGER NOT NULL DEFAULT 0,
+	input_tokens          INTEGER,                   -- NULL = response reported no usage
+	output_tokens         INTEGER,
+	cache_creation_tokens INTEGER,
+	cache_read_tokens     INTEGER,
+	prefix_hash_chain     TEXT NOT NULL DEFAULT '',  -- comma-joined cumulative digests
+	chain_len             INTEGER NOT NULL DEFAULT 0,
+	error                 TEXT NOT NULL DEFAULT '',
+	request_key           TEXT NOT NULL DEFAULT '',  -- dedupe_key of the paired transcript request
+	dedupe_key            TEXT NOT NULL UNIQUE
+);
+CREATE INDEX idx_gw_request_ts ON gw_request(ts);
+CREATE INDEX idx_gw_request_class ON gw_request(api_class);
+CREATE INDEX idx_gw_request_match ON gw_request(request_key) WHERE request_key != '';
+`
+
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5}
 
 // Block.Referenced states.
 const (
@@ -629,6 +670,207 @@ func (t *Tx) InsertOTelEvent(e OTelEvent) (bool, error) {
 	return n > 0, err
 }
 
+// --- gateway (reqlog) writes ---
+
+type GwRequest struct {
+	SourceID            int64
+	PGID                int64
+	RouterReqID         string
+	TS                  string
+	Method              string
+	Path                string
+	Model               string
+	BackendModel        string
+	BackendURL          string
+	ResolvedVia         string
+	APIClass            string
+	ViaToolProxy        bool
+	Stream              bool
+	Status              int64
+	LatencyMS           int64
+	InputTokens         *int64
+	OutputTokens        *int64
+	CacheCreationTokens *int64
+	CacheReadTokens     *int64
+	PrefixHashChain     string
+	ChainLen            int64
+	Error               string
+	DedupeKey           string
+}
+
+// InsertGwRequest inserts a gateway request row, returning true when the row
+// is new. Reqlog rows are immutable once written (the router logs after the
+// response completes), so a duplicate dedupe key is a re-ingest no-op.
+func (t *Tx) InsertGwRequest(g GwRequest) (bool, error) {
+	res, err := t.tx.Exec(`
+		INSERT INTO gw_request (
+			source_id, pg_id, router_req_id, ts, method, path, model,
+			backend_model, backend_url, resolved_via, api_class,
+			via_tool_proxy, stream, status, latency_ms,
+			input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+			prefix_hash_chain, chain_len, error, dedupe_key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (dedupe_key) DO NOTHING`,
+		g.SourceID, g.PGID, g.RouterReqID, g.TS, g.Method, g.Path, g.Model,
+		g.BackendModel, g.BackendURL, g.ResolvedVia, g.APIClass,
+		g.ViaToolProxy, g.Stream, g.Status, g.LatencyMS,
+		g.InputTokens, g.OutputTokens, g.CacheCreationTokens, g.CacheReadTokens,
+		g.PrefixHashChain, g.ChainLen, g.Error, g.DedupeKey)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// MaxGwPGID returns the highest origin-Postgres row id already ingested for a
+// source — the incremental-pull cursor. 0 means nothing ingested yet.
+func (s *Store) MaxGwPGID(sourceID int64) (int64, error) {
+	var id int64
+	err := s.db.QueryRow(
+		`SELECT COALESCE(MAX(pg_id), 0) FROM gw_request WHERE source_id = ?`, sourceID).Scan(&id)
+	return id, err
+}
+
+// gwMatchWindowMinutes bounds the timestamp distance between a gateway row
+// (logged at request start) and its transcript request row (stamped when the
+// response message is written). Generous — a max-effort response can stream
+// for many minutes — because the usage tuple carries the real signal.
+const gwMatchWindowMinutes = 30.0
+
+// MatchGwRequests pairs anthropic-class gateway rows with transcript request
+// rows. The router never sees harness session ids and its request_id is its
+// own (Claude Code sends no X-Request-ID), so the join is inferred: a
+// transcript request with the exact same usage tuple (input, output,
+// cache_creation, cache_read) within the time window, closest timestamp
+// first, each transcript request claimed at most once. Collisions are
+// effectively impossible for real prompts; tiny look-alike utility calls
+// could in principle cross-pair, which is harmless for attribution.
+// Unmatched gateway rows are expected and interesting: requests the harness
+// never wrote to a transcript (count_tokens probes, quota pings, other
+// machines' traffic).
+//
+// Returns how many rows were newly matched and how many usage-bearing
+// anthropic rows remain unmatched. Idempotent; call after every ingest (new
+// gateway rows and new transcript rows both create match opportunities).
+func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
+	err = s.WithTx(func(t *Tx) error {
+		rows, err := t.tx.Query(`
+			SELECT id, ts, input_tokens, output_tokens,
+				COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0)
+			FROM gw_request
+			WHERE request_key = '' AND api_class = 'anthropic' AND status = 200
+			  AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL
+			ORDER BY ts`)
+		if err != nil {
+			return err
+		}
+		type cand struct {
+			id                  int64
+			ts                  string
+			in, out, ccre, cred int64
+		}
+		var pending []cand
+		for rows.Next() {
+			var c cand
+			if err := rows.Scan(&c.id, &c.ts, &c.in, &c.out, &c.ccre, &c.cred); err != nil {
+				rows.Close()
+				return err
+			}
+			pending = append(pending, c)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, c := range pending {
+			var key string
+			err := t.tx.QueryRow(`
+				SELECT r.dedupe_key FROM request r
+				WHERE r.input_tokens = ? AND r.output_tokens = ?
+				  AND r.cache_creation_tokens = ? AND r.cache_read_tokens = ?
+				  AND ABS(julianday(r.ts) - julianday(?)) * 1440.0 <= ?
+				  AND r.dedupe_key NOT IN
+				      (SELECT request_key FROM gw_request WHERE request_key != '')
+				ORDER BY ABS(julianday(r.ts) - julianday(?))
+				LIMIT 1`,
+				c.in, c.out, c.ccre, c.cred, c.ts, gwMatchWindowMinutes, c.ts).Scan(&key)
+			if err == sql.ErrNoRows {
+				unmatched++
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if _, err := t.tx.Exec(
+				`UPDATE gw_request SET request_key = ? WHERE id = ?`, key, c.id); err != nil {
+				return err
+			}
+			matched++
+		}
+		return nil
+	})
+	return matched, unmatched, err
+}
+
+// GwStatus summarizes captured gateway data for `tokenator reqlog --status`.
+type GwStatus struct {
+	Rows    int64
+	ByClass []NameValue
+	MinTS   string
+	MaxTS   string
+
+	// anthropic-class detail
+	AnthRows        int64
+	AnthUsage       int64 // rows carrying usage (the matchable population)
+	AnthMatched     int64
+	AnthInput       int64
+	AnthOutput      int64
+	AnthCacheRead   int64
+	AnthCacheCreate int64
+	ChainMax        int64 // longest prefix hash chain seen
+}
+
+func (s *Store) GwStatus() (GwStatus, error) {
+	var st GwStatus
+	err := s.db.QueryRow(`
+		SELECT COUNT(*), COALESCE(MIN(ts), ''), COALESCE(MAX(ts), '') FROM gw_request`).
+		Scan(&st.Rows, &st.MinTS, &st.MaxTS)
+	if err != nil || st.Rows == 0 {
+		return st, err
+	}
+	rows, err := s.db.Query(`
+		SELECT COALESCE(NULLIF(api_class, ''), '(none)'), COUNT(*)
+		FROM gw_request GROUP BY 1 ORDER BY 2 DESC`)
+	if err != nil {
+		return st, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nv NameValue
+		if err := rows.Scan(&nv.Name, &nv.Value); err != nil {
+			return st, err
+		}
+		st.ByClass = append(st.ByClass, nv)
+	}
+	if err := rows.Err(); err != nil {
+		return st, err
+	}
+	err = s.db.QueryRow(`
+		SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL
+			                       AND status = 200 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN request_key != '' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0),
+			COALESCE(MAX(chain_len), 0)
+		FROM gw_request WHERE api_class = 'anthropic'`).
+		Scan(&st.AnthRows, &st.AnthUsage, &st.AnthMatched,
+			&st.AnthInput, &st.AnthOutput, &st.AnthCacheRead, &st.AnthCacheCreate,
+			&st.ChainMax)
+	return st, err
+}
+
 // --- reads ---
 
 type RollupRow struct {
@@ -681,7 +923,7 @@ func (s *Store) Rollup(by, sinceTS string) ([]RollupRow, error) {
 
 type TableCounts struct {
 	Sources, Sessions, Requests, Blocks, Compactions, Files int64
-	OTelDatapoints, OTelEvents                              int64
+	OTelDatapoints, OTelEvents, GwRequests                  int64
 }
 
 func (s *Store) Counts() (TableCounts, error) {
@@ -698,6 +940,7 @@ func (s *Store) Counts() (TableCounts, error) {
 		{"ingest_file", &c.Files},
 		{"otel_datapoint", &c.OTelDatapoints},
 		{"otel_event", &c.OTelEvents},
+		{"gw_request", &c.GwRequests},
 	} {
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM " + q.table).Scan(q.dst); err != nil {
 			return c, err
