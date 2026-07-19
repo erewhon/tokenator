@@ -73,6 +73,7 @@ commands:
             weights by est tokens × requests kept in context)
   waste     repeat reads, oversized results, long-resident heavyweights
   cache     cache doctor: invalidation events, causes, reuse scores
+            (--wire: classify from router prefix hash chains)
   session   single-session view: timeline, composition, events
             (session <id-or-slug-prefix> [--html out.html])
   otel      OTLP/HTTP receiver for Claude Code telemetry (--status for summary)
@@ -314,6 +315,8 @@ func cmdCache(args []string) error {
 	since := fs.String("since", "", "window like 7d, 24h (default: all time; applied per session)")
 	limit := fs.Int("limit", 10, "worst sessions to list")
 	session := fs.String("session", "", "session id or slug prefix: per-request drill-down")
+	wire := fs.Bool("wire", false,
+		"wire mode: classify from router prefix hash chains (needs `tokenator reqlog` data) instead of inferring from usage")
 	fs.Parse(args)
 
 	st, err := store.Open(*dbPath)
@@ -325,6 +328,9 @@ func cmdCache(args []string) error {
 	sinceTS, err := parseSince(*since)
 	if err != nil {
 		return err
+	}
+	if *wire {
+		return runWireCache(st, sinceTS, *session, *limit)
 	}
 	reqs, err := st.RequestsForCache(sinceTS, *session)
 	if err != nil {
@@ -353,6 +359,38 @@ func cmdCache(args []string) error {
 		return report.RenderCacheSession(os.Stdout, aReqs, rep)
 	}
 	return report.RenderCacheSummary(os.Stdout, rep, *limit)
+}
+
+// runWireCache is `tokenator cache --wire`: the chain-grounded doctor over
+// gateway-matched requests.
+func runWireCache(st *store.Store, sinceTS, sessionPrefix string, limit int) error {
+	rows, err := st.GwChainRows(sinceTS, sessionPrefix)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		log.Print("no matched gateway requests — run `tokenator reqlog` then `tokenator ingest` first")
+		return nil
+	}
+	comps, err := st.CompactionTimes()
+	if err != nil {
+		return err
+	}
+	reqs := make([]analyze.WireReq, len(rows))
+	for i, r := range rows {
+		reqs[i] = analyze.WireReq{
+			SessionID: r.SessionID, Project: r.Project, SessionKey: r.SessionKey,
+			Title: r.Title, TS: r.TS, Model: r.Model, Chain: r.Chain,
+			Input: r.Input, Output: r.Output,
+			CacheRead: r.CacheRead, CacheWrite: r.CacheWrite,
+			Write5m: r.Write5m, Write1h: r.Write1h,
+		}
+	}
+	rep := analyze.Wire(reqs, comps)
+	if sessionPrefix != "" {
+		return report.RenderWireSession(os.Stdout, rep)
+	}
+	return report.RenderWireSummary(os.Stdout, rep, limit)
 }
 
 func cmdSession(args []string) error {

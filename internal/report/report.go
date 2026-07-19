@@ -332,6 +332,109 @@ func cachedPct(r store.RollupRow) string {
 	return fmt.Sprintf("%.1f%%", 100*float64(r.CacheRead)/float64(prompt))
 }
 
+// RenderWireSummary writes the wire cache doctor's fleet view: transitions
+// classified from prefix hash chains, cost from metered usage.
+func RenderWireSummary(w io.Writer, rep *analyze.WireReport, limit int) error {
+	fmt.Fprintf(w, "WIRE CACHE DOCTOR (prefix hash chains from the router)\n")
+	fmt.Fprintf(w, "requests: %s   streams: %s   transitions: %s\n",
+		comma(int64(rep.Requests)), comma(int64(rep.Streams)), comma(int64(len(rep.Transitions))))
+	if rep.Expected > 0 {
+		fmt.Fprintf(w, "warm-prefix reuse: %.1f%%   tokens re-processed after invalidations: %s\n",
+			100*float64(rep.Read)/float64(rep.Expected), comma(rep.Shortfall))
+	}
+
+	fmt.Fprintf(w, "\n")
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "CLASS\tTRANSITIONS\tEVENTS\tTOKENS RE-PROCESSED\n")
+	classes := make([]string, 0, len(rep.ByClass))
+	for c := range rep.ByClass {
+		classes = append(classes, c)
+	}
+	sort.Slice(classes, func(i, j int) bool {
+		a, b := rep.ByClass[classes[i]], rep.ByClass[classes[j]]
+		if a.Shortfall != b.Shortfall {
+			return a.Shortfall > b.Shortfall
+		}
+		return a.Transitions > b.Transitions
+	})
+	for _, c := range classes {
+		a := rep.ByClass[c]
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+			c, comma(int64(a.Transitions)), comma(int64(a.Events)), comma(a.Shortfall))
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(w, "\nWORST SESSIONS (by tokens re-processed)\n")
+	tw = tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "PROJECT\tSESSION\tEVENTS\tRE-PROCESSED\tREUSE\n")
+	n := 0
+	for _, s := range rep.Sessions {
+		if s.Events == 0 || n >= limit {
+			continue
+		}
+		n++
+		label := s.SessionKey
+		if s.Title != "" {
+			label = truncate(s.SessionKey, 12) + " — " + s.Title
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%.1f%%\n",
+			truncate(s.Project, 24), truncate(label, 52),
+			comma(int64(s.Events)), comma(s.Shortfall), 100*s.Reuse())
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "\nclasses: divergence named by chain segment — tools_changed = segment 0, system_changed = segment 1, history_edit = message rewrite (compaction when at a compact boundary), truncated = history got shorter; marker_rotation = only the previous final message re-serialized (cache_control moved — benign); ttl_expiry / unexplained_miss = content unchanged but the cache missed anyway\nonly gateway-matched requests are analyzed — run `tokenator reqlog` and `tokenator ingest` first\n")
+	return nil
+}
+
+// RenderWireSession writes the per-transition drill-down for one session.
+func RenderWireSession(w io.Writer, rep *analyze.WireReport) error {
+	if len(rep.Transitions) == 0 {
+		fmt.Fprintf(w, "no chained transitions for this session — needs ≥2 gateway-matched requests on one model stream\n")
+		return nil
+	}
+	first := rep.Transitions[0]
+	fmt.Fprintf(w, "WIRE CACHE DOCTOR — session %s (%s)\n\n", first.SessionKey, first.Project)
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "TS\tGAP\tSEGS\tCOMMON\tCLASS\tCACHE READ\tSHORTFALL\n")
+	for _, tr := range rep.Transitions {
+		class := tr.Class
+		if tr.EditIndex >= 0 {
+			class = fmt.Sprintf("%s @msg %d", class, tr.EditIndex)
+		}
+		mark := ""
+		if tr.Event {
+			mark = " ⚠"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%d→%d\t%d\t%s%s\t%s\t%s\n",
+			tr.TS, gapStr(tr.GapSec), tr.PrevSegs, tr.CurSegs, tr.Common,
+			class, mark, comma(tr.CacheRead), comma(tr.Shortfall))
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if rep.Expected > 0 {
+		fmt.Fprintf(w, "\nwarm-prefix reuse: %.1f%%   tokens re-processed: %s\n",
+			100*float64(rep.Read)/float64(rep.Expected), comma(rep.Shortfall))
+	}
+	return nil
+}
+
+// gapStr renders an idle gap compactly: 45s, 12m, 3h20m.
+func gapStr(sec int64) string {
+	switch {
+	case sec < 120:
+		return fmt.Sprintf("%ds", sec)
+	case sec < 3600:
+		return fmt.Sprintf("%dm", sec/60)
+	default:
+		return fmt.Sprintf("%dh%02dm", sec/3600, (sec%3600)/60)
+	}
+}
+
 // RenderGwStatus writes the gateway (reqlog) capture summary: what the
 // router saw on the wire, and how much of it paired with transcript rows.
 func RenderGwStatus(w io.Writer, st store.GwStatus) error {
