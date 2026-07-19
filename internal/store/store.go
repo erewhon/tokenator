@@ -1175,6 +1175,67 @@ func (s *Store) RequestsForCache(sinceTS, sessionPrefix string) ([]CacheReq, err
 	return out, rows.Err()
 }
 
+// --- wire cache analysis inputs ---
+
+// GwChainRow feeds the wire cache doctor (internal/analyze): one matched
+// anthropic gateway request with its prefix hash chain, attributed to a
+// transcript session through the inferred request pairing. Unmatched rows
+// (utility calls, other machines) carry no session and are excluded.
+type GwChainRow struct {
+	SessionID  int64
+	Project    string
+	SessionKey string
+	Title      string
+	TS         string
+	Model      string
+	Chain      string
+	Input      int64
+	Output     int64
+	CacheRead  int64
+	CacheWrite int64
+	Write5m    *int64 // TTL split from the matched transcript row, when reported
+	Write1h    *int64
+}
+
+// GwChainRows returns wire-doctor input ordered by (session, ts). The since
+// filter applies at SESSION granularity like RequestsForCache — cutting a
+// session mid-way would fabricate a cold start. sessionPrefix narrows to
+// sessions whose harness id or slug starts with the prefix.
+func (s *Store) GwChainRows(sinceTS, sessionPrefix string) ([]GwChainRow, error) {
+	rows, err := s.db.Query(`
+		SELECT r.session_id, s.project, s.harness_session_id, s.title, g.ts, g.model,
+			g.prefix_hash_chain,
+			COALESCE(g.input_tokens, 0), COALESCE(g.output_tokens, 0),
+			COALESCE(g.cache_read_tokens, 0), COALESCE(g.cache_creation_tokens, 0),
+			r.cache_creation_5m_tokens, r.cache_creation_1h_tokens
+		FROM gw_request g
+		JOIN request r ON r.dedupe_key = g.request_key
+		JOIN session s ON s.id = r.session_id
+		WHERE g.api_class = 'anthropic' AND g.status = 200 AND g.chain_len > 0
+		  AND (? = '' OR r.session_id IN (
+			SELECT r2.session_id FROM gw_request g2
+			JOIN request r2 ON r2.dedupe_key = g2.request_key
+			WHERE g2.ts >= ?))
+		  AND (? = '' OR s.harness_session_id LIKE ? || '%' OR s.slug LIKE ? || '%')
+		ORDER BY r.session_id, g.ts`,
+		sinceTS, sinceTS, sessionPrefix, sessionPrefix, sessionPrefix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GwChainRow
+	for rows.Next() {
+		var r GwChainRow
+		if err := rows.Scan(&r.SessionID, &r.Project, &r.SessionKey, &r.Title, &r.TS, &r.Model,
+			&r.Chain, &r.Input, &r.Output, &r.CacheRead, &r.CacheWrite,
+			&r.Write5m, &r.Write1h); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // --- residency inputs ---
 
 // ResBlockRow feeds the residency analyzer (internal/analyze).

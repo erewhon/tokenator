@@ -42,10 +42,35 @@ machines' sessions, and Claude Code's internal utility calls (title
 generation and similar), which hit the API but write no usage rows to any
 transcript.
 
-## What the chain unlocks (next)
+## The wire-level cache doctor
 
-The wire-level cache doctor: diff consecutive prefix hash chains within a
-session to name the exact segment where the cached prefix diverged —
-replacing M3's inference from usage sequences with ground truth. Chain
-lengths reach thousands of segments, so diffs are cheap string-prefix
-comparisons over `gw_request.prefix_hash_chain`.
+`tokenator cache --wire` diffs consecutive prefix hash chains within each
+(session, model) stream and names the exact segment where the cached prefix
+diverged: segment 0 = tools, 1 = system, k≥2 = message k−2 (assumes tools
+and system present — true for every Claude Code request). Event causes
+follow the offline doctor's precedence (compaction → TTL → the divergence
+class) and share its cost gates, so `cache` and `cache --wire` report
+comparable numbers. `--session <prefix>` prints the per-transition
+timeline.
+
+Two things the first live day taught us that inference could not:
+
+- **The chain is noisier than the cache.** Claude Code moves its
+  `cache_control` breakpoint to the newest message every request, so the
+  previous request's final message always re-serializes → the chain
+  "diverges" at exactly PrevSegs−1 while cache reads stay fully warm
+  (observed shortfall: 1–2 tokens). Classified as `marker_rotation`, and
+  99% of all transitions are this. The same churn hits the tools segment:
+  `tools_changed` with a fully-warm read is placement noise, not a tool
+  change.
+- **Every material miss was TTL.** All costed events in the first day
+  (1.4M re-processed tokens) sat behind 1h+ idle gaps — including two that
+  also showed tools-segment divergence, where blaming the tool change
+  would have suggested a fixable cost that isn't. Wire truth confirms
+  M3's inference: idle-gap expiry dominates, genuine history edits are
+  rare.
+
+A router-side refinement would sharpen this further: stripping
+`cache_control` keys before hashing in `anthropicPrefixChain` would make
+chain divergence mean content divergence, eliminating the marker_rotation
+class entirely.
