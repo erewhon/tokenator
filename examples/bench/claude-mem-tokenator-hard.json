@@ -1,0 +1,19 @@
+{
+  "name": "claude-mem-tok-hard",
+  "prompt": "internal/store/top_test.go specifies a store method TopSessions that does not exist yet. Implement it following the store package's existing query patterns so the test passes. Then add a `top` subcommand to the tokenator CLI (cmd/tokenator) that renders the heaviest sessions as a terminal table using the existing report package conventions, and mention it in the usage text. `go build ./...` and `go test ./...` must pass, and `go run ./cmd/tokenator top --db ./bench-tmp.db` must exit 0 on an empty database.",
+  "workspace": "/home/erewhon/.local/share/tokenator/bench/templates/tokenator",
+  "workspace_as": "tokenator",
+  "checks": [
+    {"name": "build", "cmd": "go build ./..."},
+    {"name": "tests", "cmd": "go test ./..."},
+    {"name": "top-runs", "cmd": "go run ./cmd/tokenator top --db ./bench-tmp.db"}
+  ],
+  "trials": 3,
+  "timeout_seconds": 600,
+  "env": {"ANTHROPIC_BASE_URL": "https://llm.bcc.sh"},
+  "arms": [
+    {"name": "clean", "harness": "claude_code", "model": "sonnet"},
+    {"name": "mem", "harness": "claude_code", "model": "sonnet",
+     "claude": {"plugin_dirs": ["/home/erewhon/.claude/plugins/cache/thedotmack/claude-mem/10.5.5"]}}
+  ]
+}
