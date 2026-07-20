@@ -52,6 +52,8 @@ func main() {
 		err = cmdReqlog(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "bench":
+		err = cmdBench(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "-h", "--help", "help":
@@ -84,6 +86,8 @@ commands:
             (--dsn or $TOKENATOR_REQLOG_DSN; --status for summary)
   serve     localhost web UI: session browser, content search, transcripts
             (--listen 127.0.0.1:8990)
+  bench     A/B harness: run arms × trials in isolated sessions and compare
+            (bench run <spec.json> | report | list | ingest)
   doctor    show database and source status
 
 common flags:

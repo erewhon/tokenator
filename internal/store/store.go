@@ -228,7 +228,7 @@ CREATE INDEX idx_gw_request_class ON gw_request(api_class);
 CREATE INDEX idx_gw_request_match ON gw_request(request_key) WHERE request_key != '';
 `
 
-var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5}
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6}
 
 // Block.Referenced states.
 const (
