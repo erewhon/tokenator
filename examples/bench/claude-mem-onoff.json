@@ -1,0 +1,17 @@
+{
+  "name": "claude-mem-onoff",
+  "prompt": "The test suite in this Go project fails. Find and fix the bug so `go test ./...` passes. Do not modify the test files.",
+  "workspace": "widget-bug",
+  "checks": [
+    {"name": "tests", "cmd": "go test ./..."},
+    {"name": "test-untouched", "cmd": "cmp inventory_test.go .orig/inventory_test.go"}
+  ],
+  "trials": 3,
+  "timeout_seconds": 300,
+  "env": {"ANTHROPIC_BASE_URL": "https://llm.bcc.sh"},
+  "arms": [
+    {"name": "clean", "harness": "claude_code", "model": "sonnet"},
+    {"name": "mem", "harness": "claude_code", "model": "sonnet",
+     "claude": {"plugin_dirs": ["/home/erewhon/.claude/plugins/cache/thedotmack/claude-mem/10.5.5"]}}
+  ]
+}
