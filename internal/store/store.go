@@ -1448,3 +1448,112 @@ func (s *Store) BiggestResults(sinceTS string, limit int) ([]BigBlockRow, error)
 	}
 	return out, rows.Err()
 }
+
+// --- session browser (serve mode) ---
+
+// SessionListRow is one session in the browser list: identity plus request
+// aggregates. SourceKind/SourceRoot let the transcript reader locate the
+// underlying files without any configuration.
+type SessionListRow struct {
+	ID         int64
+	Key        string // harness_session_id
+	Slug       string
+	Project    string
+	Title      string
+	Agent      string
+	SourceKind string
+	SourceRoot string
+	StartedAt  string
+	EndedAt    string
+	Requests   int64
+	Input      int64
+	Output     int64
+	CacheRead  int64
+	CacheWrite int64
+}
+
+// SessionFilter narrows SessionList. Zero value = newest sessions, no filter.
+type SessionFilter struct {
+	Project string // exact project name
+	SinceTS string // sessions active at/after this RFC3339 bound
+	Text    string // substring of title, slug, cwd, or session id
+	Limit   int    // max rows (0 = 100)
+}
+
+// SessionList returns sessions newest-first with request aggregates.
+// Sessions without request rows (e.g. sidechains) are included with zeros.
+func (s *Store) SessionList(f SessionFilter) ([]SessionListRow, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	like := "%" + f.Text + "%"
+	rows, err := s.db.Query(`
+		SELECT sess.id, sess.harness_session_id, sess.slug, sess.project, sess.title,
+			sess.agent, src.kind, src.root, sess.started_at, sess.ended_at,
+			COALESCE(r.n, 0), COALESCE(r.inp, 0), COALESCE(r.outp, 0),
+			COALESCE(r.rd, 0), COALESCE(r.wr, 0)
+		FROM session sess
+		JOIN source src ON src.id = sess.source_id
+		LEFT JOIN (
+			SELECT session_id, COUNT(*) AS n, SUM(input_tokens) AS inp,
+				SUM(output_tokens) AS outp, SUM(cache_read_tokens) AS rd,
+				SUM(cache_creation_tokens) AS wr
+			FROM request GROUP BY session_id
+		) r ON r.session_id = sess.id
+		WHERE (? = '' OR sess.project = ?)
+		  AND (? = '' OR MAX(sess.started_at, sess.ended_at) >= ?)
+		  AND (? = '' OR sess.title LIKE ? OR sess.slug LIKE ?
+		       OR sess.cwd LIKE ? OR sess.harness_session_id LIKE ?)
+		ORDER BY MAX(sess.started_at, sess.ended_at) DESC
+		LIMIT ?`,
+		f.Project, f.Project, f.SinceTS, f.SinceTS,
+		f.Text, like, like, like, like, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SessionListRow
+	for rows.Next() {
+		var r SessionListRow
+		if err := rows.Scan(&r.ID, &r.Key, &r.Slug, &r.Project, &r.Title,
+			&r.Agent, &r.SourceKind, &r.SourceRoot, &r.StartedAt, &r.EndedAt,
+			&r.Requests, &r.Input, &r.Output, &r.CacheRead, &r.CacheWrite); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// Projects lists distinct non-empty project names, most recently active first.
+func (s *Store) Projects() ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT project FROM session
+		WHERE project != ''
+		GROUP BY project
+		ORDER BY MAX(MAX(started_at, ended_at)) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// SessionSource resolves one session's source kind and root for the
+// transcript reader.
+func (s *Store) SessionSource(sessionID int64) (kind, root string, err error) {
+	err = s.db.QueryRow(`
+		SELECT src.kind, src.root FROM session sess
+		JOIN source src ON src.id = sess.source_id
+		WHERE sess.id = ?`, sessionID).Scan(&kind, &root)
+	return kind, root, err
+}

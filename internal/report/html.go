@@ -25,9 +25,16 @@ const (
 // context-size timeline with compaction/invalidation markers, the
 // new-content stacked composition, and the relief tables.
 func RenderSessionHTML(w io.Writer, v *SessionView) error {
+	return RenderSessionHTMLNav(w, v, "")
+}
+
+// RenderSessionHTMLNav is RenderSessionHTML with a trusted navigation
+// fragment injected at the top of the page (used by serve mode).
+func RenderSessionHTMLNav(w io.Writer, v *SessionView, nav template.HTML) error {
 	data := struct {
 		V              *SessionView
 		Label          string
+		Nav            template.HTML
 		Chart1, Chart2 template.HTML
 		DataJSON       template.JS
 		ReusePct       string
@@ -37,6 +44,7 @@ func RenderSessionHTML(w io.Writer, v *SessionView) error {
 	}{
 		V:         v,
 		Label:     sessionLabel(v),
+		Nav:       nav,
 		Chart1:    template.HTML(buildTimelineSVG(v)),
 		Chart2:    template.HTML(buildCompositionSVG(v)),
 		DataJSON:  template.JS(buildChartJSON(v)),
@@ -284,11 +292,9 @@ func buildChartJSON(v *SessionView) string {
 	return string(out)
 }
 
-const sessionPageTmpl = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tokenator — {{.Label}}</title>
-<style>
+// BaseCSS is the shared visual system (palette slots, cards, tables,
+// tooltips) reused by serve-mode pages so everything reads as one tool.
+const BaseCSS = `
 .viz-root {
   color-scheme: light;
   --surface-1:#fcfcfb; --page:#f9f9f7; --ink-1:#0b0b0b; --ink-2:#52514e;
@@ -350,8 +356,15 @@ td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
   box-shadow:0 2px 8px rgba(0,0,0,.12); visibility:hidden; z-index:10; max-width:280px; }
 #tip .t { color:var(--muted); font-size:11px; } #tip b { font-variant-numeric:tabular-nums; }
 footer { max-width:960px; margin:0 auto; color:var(--muted); font-size:11px; }
-</style></head>
+`
+
+const sessionPageTmpl = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tokenator — {{.Label}}</title>
+<style>` + BaseCSS + `</style></head>
 <body class="viz-root">
+{{.Nav}}
 <div class="card">
   <h1>{{.Label}}</h1>
   <p class="meta">session {{.V.Meta.Key}}{{if .V.Meta.Agent}} · agent: {{.V.Meta.Agent}}{{end}}
