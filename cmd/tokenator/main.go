@@ -22,6 +22,7 @@ import (
 	"github.com/erewhon/tokenator/internal/ingest/otel"
 	"github.com/erewhon/tokenator/internal/ingest/reqlog"
 	"github.com/erewhon/tokenator/internal/report"
+	"github.com/erewhon/tokenator/internal/serve"
 	"github.com/erewhon/tokenator/internal/store"
 )
 
@@ -49,6 +50,8 @@ func main() {
 		err = cmdOTel(os.Args[2:])
 	case "reqlog":
 		err = cmdReqlog(os.Args[2:])
+	case "serve":
+		err = cmdServe(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "-h", "--help", "help":
@@ -79,6 +82,8 @@ commands:
   otel      OTLP/HTTP receiver for Claude Code telemetry (--status for summary)
   reqlog    pull gateway request rows from the LLM router's reqlog Postgres
             (--dsn or $TOKENATOR_REQLOG_DSN; --status for summary)
+  serve     localhost web UI: session browser, content search, transcripts
+            (--listen 127.0.0.1:8990)
   doctor    show database and source status
 
 common flags:
@@ -514,6 +519,23 @@ func cmdReqlog(args []string) error {
 	}
 	log.Printf("reqlog %s: %s (%.1fs)", src.Root(), stats, time.Since(start).Seconds())
 	return nil
+}
+
+func cmdServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDBPath(), "database path")
+	listen := fs.String("listen", "127.0.0.1:8990", "listen address (keep it loopback: no auth)")
+	scan := fs.Int("scan-limit", 80, "max sessions a content search scans (newest first)")
+	fs.Parse(args)
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	srv := &serve.Server{Store: st, ScanLimit: *scan}
+	return srv.ListenAndServe(*listen)
 }
 
 func cmdDoctor(args []string) error {
