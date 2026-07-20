@@ -1,0 +1,19 @@
+{
+  "name": "claude-mem-tokenator",
+  "prompt": "Add a `version` subcommand to the tokenator CLI (cmd/tokenator) that prints exactly `tokenator 0.1.0`. Follow the existing subcommand pattern and mention it in the usage text. Make sure `go build ./...` and `go test ./...` still pass.",
+  "workspace": "/home/erewhon/.local/share/tokenator/bench/templates/tokenator",
+  "workspace_as": "tokenator",
+  "checks": [
+    {"name": "build", "cmd": "go build ./..."},
+    {"name": "tests", "cmd": "go test ./..."},
+    {"name": "version-output", "cmd": "go run ./cmd/tokenator version | grep -qx 'tokenator 0.1.0'"}
+  ],
+  "trials": 3,
+  "timeout_seconds": 600,
+  "env": {"ANTHROPIC_BASE_URL": "https://llm.bcc.sh"},
+  "arms": [
+    {"name": "clean", "harness": "claude_code", "model": "sonnet"},
+    {"name": "mem", "harness": "claude_code", "model": "sonnet",
+     "claude": {"plugin_dirs": ["/home/erewhon/.claude/plugins/cache/thedotmack/claude-mem/10.5.5"]}}
+  ]
+}

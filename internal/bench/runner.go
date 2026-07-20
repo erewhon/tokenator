@@ -174,7 +174,7 @@ func (r *Runner) runTrial(ctx context.Context, runID int64, runDir string, arm *
 	tc := &trialCtx{
 		Spec:      r.Spec,
 		Arm:       arm,
-		Workspace: filepath.Join(trialDir, "workspace"),
+		Workspace: filepath.Join(trialDir, r.Spec.WorkspaceAs),
 		Home:      filepath.Join(trialDir, "home"),
 		Stdout:    filepath.Join(trialDir, "stdout.log"),
 		Stderr:    filepath.Join(trialDir, "stderr.log"),

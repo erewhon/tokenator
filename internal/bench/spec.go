@@ -23,8 +23,12 @@ type Spec struct {
 	PromptFile string `json:"prompt_file,omitempty"`
 	// Workspace is a template directory copied fresh for every trial; the
 	// agent runs with cwd inside the copy.
-	Workspace string  `json:"workspace"`
-	Checks    []Check `json:"checks,omitempty"`
+	Workspace string `json:"workspace"`
+	// WorkspaceAs names the per-trial copy's directory (default
+	// "workspace"). Tools that key project identity on the cwd basename
+	// (claude-mem does) need this to match the project they know.
+	WorkspaceAs string  `json:"workspace_as,omitempty"`
+	Checks      []Check `json:"checks,omitempty"`
 	// Trials per arm (default 3).
 	Trials int `json:"trials,omitempty"`
 	// TimeoutSeconds per trial (default 900).
@@ -168,6 +172,12 @@ func (s *Spec) resolve(baseDir string) error {
 	}
 	if fi, err := os.Stat(s.Workspace); err != nil || !fi.IsDir() {
 		return fmt.Errorf("workspace %s is not a directory", s.Workspace)
+	}
+	if s.WorkspaceAs == "" {
+		s.WorkspaceAs = "workspace"
+	}
+	if strings.ContainsAny(s.WorkspaceAs, "/ \t") || s.WorkspaceAs == "." || s.WorkspaceAs == ".." {
+		return fmt.Errorf("workspace_as %q must be a plain directory name", s.WorkspaceAs)
 	}
 	if s.Trials <= 0 {
 		s.Trials = 3

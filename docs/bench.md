@@ -45,6 +45,7 @@ serve UI work on them.
   "prompt": "Fix the failing test so `go test ./...` passes. Do not modify the test file.",
   "prompt_file": "(alternative to prompt: path relative to this file)",
   "workspace": "/home/erewhon/bench/templates/widget-bug",
+  "workspace_as": "widget (optional: the per-trial copy's directory name, default 'workspace' — claude-mem keys project memory on the cwd basename, so name it after a project it knows to measure injection)",
   "checks": [
     {"name": "tests", "cmd": "go test ./..."},
     {"name": "test-untouched", "cmd": "git diff --exit-code -- internal/widget/widget_test.go"}
