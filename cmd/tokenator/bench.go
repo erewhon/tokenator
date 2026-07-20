@@ -113,8 +113,13 @@ func cmdBenchReport(args []string) error {
 	fs := flag.NewFlagSet("bench report", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDBPath(), "database path")
 	showTrials := fs.Bool("trials", false, "include the per-trial detail table")
+	// Accept the run key before or after flags (stdlib flag stops parsing
+	// at the first positional argument).
 	fs.Parse(args)
 	prefix := fs.Arg(0)
+	if fs.NArg() > 1 {
+		fs.Parse(fs.Args()[1:])
+	}
 
 	st, err := store.Open(*dbPath)
 	if err != nil {

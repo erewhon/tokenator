@@ -89,6 +89,10 @@ the clean baseline; options add things back.
   in spec `env`) gives you wire-truth cache telemetry for every trial via
   `tokenator reqlog` + `cache --wire`.
 - Trials run sequentially by design — duration comparisons stay honest.
+- **Prompt-cache warmth crosses trials**: identical system/tools prefixes hit
+  the org-level Anthropic cache, so the first trial of an arm pays a cold
+  cache write (~4× cost) and later trials ride warm. Medians absorb this,
+  and symmetric arms each pay one cold trial — but compare totals with care.
 - OpenCode's harness-reported cost is unreliable for custom providers; the
   report prefers Claude Code's own total and flags the rest.
 - Comparing across harnesses (CC vs OC arms) confounds system prompt, tool
