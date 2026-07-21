@@ -1,0 +1,81 @@
+# GoReleaser — builds the `tokenator` CLI and publishes a Homebrew cask to
+# github.com/erewhon/homebrew-tap on every `vX.Y.Z` tag.
+# Docs: https://goreleaser.com
+version: 2
+
+project_name: tokenator
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: tokenator
+    main: ./cmd/tokenator
+    binary: tokenator
+    env:
+      - CGO_ENABLED=0 # modernc.org/sqlite is pure Go
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: tokenator
+    ids: [tokenator]
+    name_template: "tokenator_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - docs/*.md
+      - examples/bench/*.json
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  github:
+    owner: erewhon
+    name: tokenator
+
+# Homebrew: a cask installs the pre-built `tokenator` binary on macOS.
+# (Homebrew-on-Linux has no casks — Linux users grab the release tarball
+# directly or `go install`.)
+homebrew_casks:
+  - name: tokenator
+    binaries:
+      - tokenator
+    ids:
+      - tokenator
+    repository:
+      owner: erewhon
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/erewhon/tokenator"
+    description: "Token and prompt-cache profiler for AI coding agents (Claude Code, OpenCode): usage reports, cache doctor, session browser, A/B bench harness"
+    commit_author:
+      name: goreleaser-bot
+      email: noreply@byrnes.org
+    # The binary is unsigned: strip the Gatekeeper quarantine bit on install so
+    # it runs without a "developer cannot be verified" prompt.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/tokenator"]
+          end
+    caveats: |
+      Quick start:
+        tokenator ingest    # profile your Claude Code / OpenCode transcripts
+        tokenator report    # usage rollups with cache splits
+        tokenator serve     # session browser web UI on 127.0.0.1:8990
+
+      The database lives at ~/.local/share/tokenator/tokenator.db and stores
+      sizes/hashes only — never transcript content.

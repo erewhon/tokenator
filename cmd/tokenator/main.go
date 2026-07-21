@@ -26,6 +26,9 @@ import (
 	"github.com/erewhon/tokenator/internal/store"
 )
 
+// version is stamped by goreleaser via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	log.SetFlags(0)
 	if len(os.Args) < 2 {
@@ -56,6 +59,8 @@ func main() {
 		err = cmdBench(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
+	case "version", "-V", "--version":
+		fmt.Println("tokenator", version)
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -89,6 +94,7 @@ commands:
   bench     A/B harness: run arms × trials in isolated sessions and compare
             (bench run <spec.json> | report | list | ingest)
   doctor    show database and source status
+  version   print version
 
 common flags:
   -db PATH  database path (default: $XDG_DATA_HOME/tokenator/tokenator.db)
