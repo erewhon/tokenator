@@ -106,3 +106,19 @@ func TestProfilePage(t *testing.T) {
 		t.Error("profile page missing nav or label")
 	}
 }
+
+func TestMonitorLinkOnlyWhenConfigured(t *testing.T) {
+	srv := fixtureServer(t)
+	for _, path := range []string{"/session/abc", "/session/abc/transcript"} {
+		if body := get(t, srv, path); strings.Contains(body, "agent-monitor board") {
+			t.Fatalf("%s: monitor link rendered with no MonitorURL", path)
+		}
+	}
+	srv.MonitorURL = "http://127.0.0.1:8070/"
+	for _, path := range []string{"/session/abc", "/session/abc/transcript"} {
+		body := get(t, srv, path)
+		if !strings.Contains(body, `href="http://127.0.0.1:8070/" title="agent-monitor board">monitor</a>`) {
+			t.Fatalf("%s: monitor link missing:\n%s", path, body)
+		}
+	}
+}

@@ -607,6 +607,7 @@ func cmdServe(args []string) error {
 	dbPath := fs.String("db", defaultDBPath(), "database path")
 	listen := fs.String("listen", "127.0.0.1:8990", "listen address (keep it loopback: no auth)")
 	scan := fs.Int("scan-limit", 80, "max sessions a content search scans (newest first)")
+	monitorURL := fs.String("monitor-url", os.Getenv("TOKENATOR_MONITOR_URL"), "agent-monitor board URL to link from session pages (env: TOKENATOR_MONITOR_URL)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -617,7 +618,7 @@ func cmdServe(args []string) error {
 	}
 	defer st.Close()
 
-	srv := &serve.Server{Store: st, ScanLimit: *scan}
+	srv := &serve.Server{Store: st, ScanLimit: *scan, MonitorURL: *monitorURL}
 	return srv.ListenAndServe(*listen)
 }
 
