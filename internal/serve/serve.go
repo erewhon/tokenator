@@ -26,6 +26,11 @@ import (
 
 type Server struct {
 	Store *store.Store
+	// MonitorURL, when set, adds a "monitor" link to the session pages: the
+	// agent-monitor board that watches the tmux session this transcript
+	// belongs to (agent-monitor keys the same Claude Code session id once its
+	// hooks report it). Empty = no link.
+	MonitorURL string
 	// ScanLimit bounds how many sessions a content search will scan
 	// (newest first). 0 means 80.
 	ScanLimit int
@@ -193,8 +198,8 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nav := fmt.Sprintf(
-		`<p class="meta" style="max-width:960px;margin:0 auto 12px"><a href="/">&larr; sessions</a> &middot; <a href="/session/%s/transcript">transcript</a></p>`,
-		url.PathEscape(view.Meta.Key))
+		`<p class="meta" style="max-width:960px;margin:0 auto 12px"><a href="/">&larr; sessions</a> &middot; <a href="/session/%s/transcript">transcript</a>%s</p>`,
+		url.PathEscape(view.Meta.Key), s.monitorLink())
 	if err := report.RenderSessionHTMLNav(w, view, template.HTML(nav)); err != nil {
 		log.Printf("serve: render session %s: %v", key, err)
 	}
@@ -216,11 +221,20 @@ type transcriptEntry struct {
 }
 
 type transcriptData struct {
-	Meta    store.SessionMeta
-	Query   string
-	Entries []transcriptEntry
-	Total   int
-	Err     string
+	Meta       store.SessionMeta
+	Query      string
+	Entries    []transcriptEntry
+	Total      int
+	Err        string
+	MonitorURL string
+}
+
+// monitorLink is the nav fragment for MonitorURL, or "" when unset.
+func (s *Server) monitorLink() string {
+	if s.MonitorURL == "" {
+		return ""
+	}
+	return fmt.Sprintf(` &middot; <a href="%s" title="agent-monitor board">monitor</a>`, template.HTMLEscapeString(s.MonitorURL))
 }
 
 // kindSlots mirrors report's fixed palette assignment (s1..s7).
@@ -239,7 +253,7 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	data := transcriptData{Meta: meta, Query: q}
+	data := transcriptData{Meta: meta, Query: q, MonitorURL: s.MonitorURL}
 	kind, root, err := s.Store.SessionSource(meta.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

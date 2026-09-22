@@ -125,7 +125,7 @@ var transcriptTmpl = template.Must(template.New("transcript").Parse(`<!DOCTYPE h
 <body class="viz-root">
 <div class="card">
   <p class="meta" style="margin-bottom:6px"><a href="/">&larr; sessions</a> &middot;
-    <a href="/session/{{.Meta.Key}}">profile</a></p>
+    <a href="/session/{{.Meta.Key}}">profile</a>{{if .MonitorURL}} &middot; <a href="{{.MonitorURL}}" title="agent-monitor board">monitor</a>{{end}}</p>
   <h1>{{.Meta.Project}}{{if .Meta.Title}} — {{.Meta.Title}}{{end}}</h1>
   <p class="meta">session {{.Meta.Key}}{{if .Meta.Agent}} · agent: {{.Meta.Agent}}{{end}}
     · {{.Total}} entries</p>

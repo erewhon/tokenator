@@ -73,3 +73,10 @@ The database lives at `$XDG_DATA_HOME/tokenator/tokenator.db` (override with
 ## License
 
 [AGPL-3.0](LICENSE)
+
+## Cross-link to agent-monitor
+
+`tokenator serve --monitor-url http://127.0.0.1:8070` (or
+`TOKENATOR_MONITOR_URL`) adds a "monitor" link to every session page, pointing
+at the agent-monitor board. agent-monitor learns the same Claude Code session
+id from its hooks, so `pitf session <id>` can jump both ways.
