@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"context"
@@ -14,14 +14,14 @@ import (
 	"github.com/erewhon/tokenator/internal/store"
 )
 
-func cmdBench(args []string) error {
+func cmdBench(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		benchUsage()
 		return fmt.Errorf("bench needs a subcommand")
 	}
 	switch args[0] {
 	case "run":
-		return cmdBenchRun(args[1:])
+		return cmdBenchRun(ctx, args[1:])
 	case "report":
 		return cmdBenchReport(args[1:])
 	case "list":
@@ -54,15 +54,17 @@ func defaultRunsDir(dbPath string) string {
 	return filepath.Join(filepath.Dir(dbPath), "bench")
 }
 
-func cmdBenchRun(args []string) error {
-	fs := flag.NewFlagSet("bench run", flag.ExitOnError)
+func cmdBenchRun(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("bench run", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "database path")
 	runsDir := fs.String("runs-dir", "", "run directories root (default: <db dir>/bench)")
 	trials := fs.Int("trials", 0, "override the spec's trials-per-arm")
 	arm := fs.String("arm", "", "run only this arm")
 	yes := fs.Bool("yes", false, "skip the preflight confirmation")
 	resume := fs.String("resume", "", "resume an existing run by run-key prefix (spec file not needed)")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 
 	st, err := store.Open(*dbPath)
 	if err != nil {
@@ -73,7 +75,7 @@ func cmdBenchRun(args []string) error {
 		*runsDir = defaultRunsDir(*dbPath)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if *resume != "" {
@@ -110,15 +112,19 @@ func cmdBenchRun(args []string) error {
 }
 
 func cmdBenchReport(args []string) error {
-	fs := flag.NewFlagSet("bench report", flag.ExitOnError)
+	fs := flag.NewFlagSet("bench report", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "database path")
 	showTrials := fs.Bool("trials", false, "include the per-trial detail table")
 	// Accept the run key before or after flags (stdlib flag stops parsing
 	// at the first positional argument).
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 	prefix := fs.Arg(0)
 	if fs.NArg() > 1 {
-		fs.Parse(fs.Args()[1:])
+		if err := parseFlags(fs, fs.Args()[1:]); err != nil {
+			return err
+		}
 	}
 
 	st, err := store.Open(*dbPath)
@@ -146,10 +152,12 @@ func reportRun(st *store.Store, prefix string, showTrials bool) error {
 }
 
 func cmdBenchList(args []string) error {
-	fs := flag.NewFlagSet("bench list", flag.ExitOnError)
+	fs := flag.NewFlagSet("bench list", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "database path")
 	limit := fs.Int("limit", 20, "max runs")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 
 	st, err := store.Open(*dbPath)
 	if err != nil {
@@ -168,9 +176,11 @@ func cmdBenchList(args []string) error {
 }
 
 func cmdBenchIngest(args []string) error {
-	fs := flag.NewFlagSet("bench ingest", flag.ExitOnError)
+	fs := flag.NewFlagSet("bench ingest", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "database path")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: tokenator bench ingest <run-key-prefix>")
 	}
