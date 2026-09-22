@@ -130,7 +130,8 @@ tokenator doctor                  # source discovery + schema-drift sanity check
 ## Go layout
 
 ```
-cmd/tokenator/
+cmd/tokenator/         # thin wrapper: exit codes only
+cli/                   # command line: flag parsing + subcommand wiring (cli.Run; importable by pitf)
 internal/store/        # sqlite (modernc.org/sqlite — pure Go, single static binary), migrations
 internal/ingest/       # Source interface: Discover() / Backfill() / Watch()
 internal/ingest/claudecode/
