@@ -122,3 +122,76 @@ func TestMonitorLinkOnlyWhenConfigured(t *testing.T) {
 		}
 	}
 }
+
+// seedModelTraffic adds a second session ("def", opencode-style) whose only
+// trace of "qwen38" is router rows: one carrying its session id, one not.
+func seedModelTraffic(t *testing.T, srv *Server) {
+	t.Helper()
+	st := srv.Store
+	srcID, err := st.UpsertSource("opencode", "/tmp/oc", "local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gwSrc, err := st.UpsertSource("reqlog", "pg.test/router", "local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.WithTx(func(tx *store.Tx) error {
+		if _, err := tx.UpsertSession(store.Session{
+			SourceID: srcID, HarnessID: "ses_def", Project: "gadgets",
+			Title: "gadget refactor", StartedAt: "2026-07-20T09:00:00Z",
+		}); err != nil {
+			return err
+		}
+		in, out := int64(300), int64(20)
+		for i, sid := range []string{"ses_def", ""} {
+			if _, err := tx.InsertGwRequest(store.GwRequest{
+				SourceID: gwSrc, PGID: int64(i + 1), TS: "2026-07-20T09:01:00Z",
+				Method: "POST", Path: "/v1/chat/completions", Model: "qwen38",
+				ResolvedVia: "qwen3.8-27b-talos", APIClass: "chat", Status: 200,
+				InputTokens: &in, OutputTokens: &out, SessionID: sid,
+				DedupeKey: "gw" + string(rune('a'+i)),
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestModelPage(t *testing.T) {
+	srv := fixtureServer(t)
+	seedModelTraffic(t, srv)
+
+	// By router alias: only the opencode session, attributed from the router.
+	body := get(t, srv, "/model/qwen38")
+	for _, want := range []string{"model qwen38", "gadget refactor", "/session/ses_def", "router: 2 req", "1 not attributed", ">router<"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/model/qwen38 missing %q", want)
+		}
+	}
+	if strings.Contains(body, "fix flaky widget test") {
+		t.Errorf("/model/qwen38 lists the session that never used it")
+	}
+	// By resolved registry id: the same rows.
+	if body := get(t, srv, "/model/qwen3.8-27b-talos"); !strings.Contains(body, "gadget refactor") {
+		t.Errorf("/model/<resolved_via> should list the session")
+	}
+	// By the harness's own model name: the transcript session.
+	body = get(t, srv, "/model/claude-sonnet-5")
+	if !strings.Contains(body, "fix flaky widget test") || !strings.Contains(body, ">transcript<") {
+		t.Errorf("/model/claude-sonnet-5 should list session abc from its transcript")
+	}
+	// Aliases can contain a slash ("or/minimax-m3"); escaped, it stays one
+	// path segment and reaches the handler whole.
+	if body := get(t, srv, "/model/or%2Fminimax-m3"); !strings.Contains(body, "model or/minimax-m3") {
+		t.Errorf("escaped slash alias not decoded into one name")
+	}
+	// Unknown: 200 with the empty state.
+	if body := get(t, srv, "/model/nope"); !strings.Contains(body, "no session used nope") {
+		t.Errorf("/model/nope should render the empty state")
+	}
+}

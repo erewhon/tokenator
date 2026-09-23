@@ -116,6 +116,40 @@ var indexTmpl = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 </body></html>
 `))
 
+var modelTmpl = template.Must(template.New("model").Parse(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tokenator — model {{.Name}}</title>
+` + favicon + `
+<style>` + report.BaseCSS + serveCSS + `</style></head>
+<body class="viz-root">
+<div class="card">
+  <p class="meta" style="margin-bottom:6px"><a href="/">&larr; sessions</a></p>
+  <h1>model {{.Name}}</h1>
+  <p class="meta">{{len .Rows}} session{{if ne (len .Rows) 1}}s{{end}}{{if .Trimmed}} (newest {{.Limit}}){{end}}
+    · router: {{.Totals.Requests}} req · {{.GwToks}} toks · {{.GwOut}} out{{if .Totals.Unpaired}} · {{.Totals.Unpaired}} not attributed to a session{{end}}</p>
+</div>
+<div class="card">
+  {{if .Rows}}<table>
+    <tr><th>last</th><th>project</th><th>session</th><th class="n">req</th>
+      <th class="n">tokens</th><th class="n">out</th><th>from</th><th></th></tr>
+    {{range .Rows}}<tr>
+      <td class="when">{{.When}}</td>
+      <td>{{.Project}}</td>
+      <td><a class="title" href="/session/{{.Key}}/transcript">{{if .Title}}{{.Title}}{{else}}{{.Key}}{{end}}</a>
+        {{if .Agent}}<span class="agent">· {{.Agent}}</span>{{end}}</td>
+      <td class="n">{{.Requests}}</td>
+      <td class="n">{{.TotalToks}}</td>
+      <td class="n">{{.OutToks}}</td>
+      <td><span class="agent">{{.Via}}</span></td>
+      <td><a href="/session/{{.Key}}">profile</a></td>
+    </tr>{{end}}
+  </table>{{else}}<p class="muted">no session used {{.Name}} — neither a transcript nor the router log names it</p>{{end}}
+</div>
+<footer>tokenator serve · matched on the harness's model name, the router alias the caller sent, and the registry id it resolved to</footer>
+</body></html>
+`))
+
 var transcriptTmpl = template.Must(template.New("transcript").Parse(`<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
