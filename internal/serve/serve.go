@@ -49,6 +49,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("GET /session/{key}", s.handleSession)
 	mux.HandleFunc("GET /session/{key}/transcript", s.handleTranscript)
+	mux.HandleFunc("GET /model/{name}", s.handleModel)
 	return mux
 }
 
@@ -83,15 +84,15 @@ type hitView struct {
 }
 
 type indexData struct {
-	Query    string
-	Project  string
-	Since    string
-	Projects []string
-	Rows     []sessionRow
-	Searched bool
-	Scanned  int
-	ScanMS   int64
-	Limit    int
+	Query     string
+	Project   string
+	Since     string
+	Projects  []string
+	Rows      []sessionRow
+	Searched  bool
+	Scanned   int
+	ScanMS    int64
+	Limit     int
 	Truncated bool
 }
 
@@ -186,6 +187,49 @@ func decorate(list []store.SessionListRow) []sessionRow {
 		}
 	}
 	return rows
+}
+
+// --- per-model view ---
+
+type modelRow struct {
+	store.ModelSessionRow
+	When      string
+	TotalToks string
+	OutToks   string
+}
+
+type modelData struct {
+	Name    string
+	Rows    []modelRow
+	Totals  store.ModelTotals
+	GwToks  string
+	GwOut   string
+	Limit   int
+	Trimmed bool
+}
+
+// handleModel lists the sessions that used one model name — a router alias,
+// a registry id or a harness model name. An unknown name is an empty page,
+// not a 404: "nothing used it" is an answer.
+func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	const limit = 100
+	list, tot, err := s.Store.ModelSessions(name, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := modelData{Name: name, Totals: tot, Limit: limit, Trimmed: len(list) == limit,
+		GwToks: abbrev(tot.Input + tot.Output), GwOut: abbrev(tot.Output)}
+	for _, l := range list {
+		data.Rows = append(data.Rows, modelRow{
+			ModelSessionRow: l,
+			When:            day(l.LastTS),
+			TotalToks:       abbrev(l.Input + l.Output),
+			OutToks:         abbrev(l.Output),
+		})
+	}
+	render(w, modelTmpl, data)
 }
 
 // --- session profile (existing page + nav) ---
