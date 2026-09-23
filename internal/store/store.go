@@ -193,8 +193,9 @@ ALTER TABLE block ADD COLUMN first_ref_ts TEXT NOT NULL DEFAULT '';
 // ANTHROPIC_BASE_URL. Wire-observed usage plus the prefix hash chain (rolling
 // per-segment digests of the rendered prompt in cache order; hashes only,
 // content never leaves the router). request_key links a row to the transcript
-// request it paired with; the router never sees harness session ids, so the
-// pairing is inferred (see MatchGwRequests).
+// request it paired with. The pairing is inferred (see MatchGwRequests); since
+// schemaV7 a row that carries the harness session id is paired only within
+// that session.
 const schemaV5 = `
 CREATE TABLE gw_request (
 	id                    INTEGER PRIMARY KEY,
@@ -228,7 +229,18 @@ CREATE INDEX idx_gw_request_class ON gw_request(api_class);
 CREATE INDEX idx_gw_request_match ON gw_request(request_key) WHERE request_key != '';
 `
 
-var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6}
+// schemaV7 adds the caller's session id to gateway rows. llm-router-go
+// f00737c+ logs the id the harness sent (Claude Code's
+// X-Claude-Code-Session-Id, opencode's x-session-id), which is the same
+// value as session.harness_session_id — so a gateway row that carries one
+// pairs within its own session instead of across all of them. Empty means
+// the router predates the column or the harness sent none (Pi).
+const schemaV7 = `
+ALTER TABLE gw_request ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_gw_request_session ON gw_request(session_id) WHERE session_id != '';
+`
+
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7}
 
 // Block.Referenced states.
 const (
@@ -695,6 +707,7 @@ type GwRequest struct {
 	PrefixHashChain     string
 	ChainLen            int64
 	Error               string
+	SessionID           string // harness session id the caller sent; '' = none
 	DedupeKey           string
 }
 
@@ -708,14 +721,14 @@ func (t *Tx) InsertGwRequest(g GwRequest) (bool, error) {
 			backend_model, backend_url, resolved_via, api_class,
 			via_tool_proxy, stream, status, latency_ms,
 			input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
-			prefix_hash_chain, chain_len, error, dedupe_key
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			prefix_hash_chain, chain_len, error, session_id, dedupe_key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (dedupe_key) DO NOTHING`,
 		g.SourceID, g.PGID, g.RouterReqID, g.TS, g.Method, g.Path, g.Model,
 		g.BackendModel, g.BackendURL, g.ResolvedVia, g.APIClass,
 		g.ViaToolProxy, g.Stream, g.Status, g.LatencyMS,
 		g.InputTokens, g.OutputTokens, g.CacheCreationTokens, g.CacheReadTokens,
-		g.PrefixHashChain, g.ChainLen, g.Error, g.DedupeKey)
+		g.PrefixHashChain, g.ChainLen, g.Error, g.SessionID, g.DedupeKey)
 	if err != nil {
 		return false, err
 	}
@@ -739,11 +752,16 @@ func (s *Store) MaxGwPGID(sourceID int64) (int64, error) {
 const gwMatchWindowMinutes = 30.0
 
 // MatchGwRequests pairs anthropic-class gateway rows with transcript request
-// rows. The router never sees harness session ids and its request_id is its
-// own (Claude Code sends no X-Request-ID), so the join is inferred: a
-// transcript request with the exact same usage tuple (input, output,
-// cache_creation, cache_read) within the time window, closest timestamp
-// first, each transcript request claimed at most once. Collisions are
+// rows. The router's request_id is its own (Claude Code sends no
+// X-Request-ID), so the join is inferred: a transcript request with the
+// exact same usage tuple (input, output, cache_creation, cache_read) within
+// the time window, closest timestamp first, each transcript request claimed
+// at most once. When the gateway row carries the harness session id
+// (schemaV7), candidates are restricted to that session's requests — two
+// concurrent sessions can no longer cross-pair — and there is no fallback
+// to other sessions: a row whose session has no match yet stays unmatched
+// until its transcript is ingested. Subagent (sidechain) requests share the
+// parent's session id in both views, so they need no special case. Collisions are
 // effectively impossible for real prompts; tiny look-alike utility calls
 // could in principle cross-pair, which is harmless for attribution.
 // Unmatched gateway rows are expected and interesting: requests the harness
@@ -757,7 +775,8 @@ func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
 	err = s.WithTx(func(t *Tx) error {
 		rows, err := t.tx.Query(`
 			SELECT id, ts, input_tokens, output_tokens,
-				COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0)
+				COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0),
+				session_id
 			FROM gw_request
 			WHERE request_key = '' AND api_class = 'anthropic' AND status = 200
 			  AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL
@@ -769,11 +788,12 @@ func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
 			id                  int64
 			ts                  string
 			in, out, ccre, cred int64
+			session             string
 		}
 		var pending []cand
 		for rows.Next() {
 			var c cand
-			if err := rows.Scan(&c.id, &c.ts, &c.in, &c.out, &c.ccre, &c.cred); err != nil {
+			if err := rows.Scan(&c.id, &c.ts, &c.in, &c.out, &c.ccre, &c.cred, &c.session); err != nil {
 				rows.Close()
 				return err
 			}
@@ -792,9 +812,12 @@ func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
 				  AND ABS(julianday(r.ts) - julianday(?)) * 1440.0 <= ?
 				  AND r.dedupe_key NOT IN
 				      (SELECT request_key FROM gw_request WHERE request_key != '')
+				  AND (? = '' OR r.session_id IN
+				      (SELECT id FROM session WHERE harness_session_id = ?))
 				ORDER BY ABS(julianday(r.ts) - julianday(?))
 				LIMIT 1`,
-				c.in, c.out, c.ccre, c.cred, c.ts, gwMatchWindowMinutes, c.ts).Scan(&key)
+				c.in, c.out, c.ccre, c.cred, c.ts, gwMatchWindowMinutes,
+				c.session, c.session, c.ts).Scan(&key)
 			if err == sql.ErrNoRows {
 				unmatched++
 				continue

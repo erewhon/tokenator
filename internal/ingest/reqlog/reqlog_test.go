@@ -2,6 +2,7 @@ package reqlog
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -202,4 +203,87 @@ func TestLateTranscriptMatches(t *testing.T) {
 	if matched != 1 || unmatched != 0 {
 		t.Errorf("late match = (%d, %d), want (1, 0)", matched, unmatched)
 	}
+}
+
+func sessRow(id int64, ts time.Time, session string) Row {
+	r := anthRow(id, ts, 700, 50, 0, 9000)
+	r.SessionID = session
+	return r
+}
+
+// Two sessions send look-alike requests (same usage tuple) seconds apart.
+// By time alone gw row 1 is closest to session A's request; its session id
+// says it belongs to B, and that wins.
+func TestSessionIDPairsWithinSession(t *testing.T) {
+	srcID = 0
+	st := testStore(t)
+	seedRequest(t, st, "A", t0.Add(10*time.Second), 700, 50, 0, 9000)
+	seedRequest(t, st, "B", t0.Add(20*time.Second), 700, 50, 0, 9000)
+
+	src := &fakeSource{rows: []Row{
+		sessRow(1, t0.Add(9*time.Second), "sess-B"),
+		sessRow(2, t0.Add(21*time.Second), "sess-A"),
+	}}
+	stats, err := (&Ingester{Src: src}).Run(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Matched != 2 || stats.Unmatched != 0 {
+		t.Fatalf("stats = %+v, want Matched=2", stats)
+	}
+	got := pairs(t, st)
+	if got[1] != "B" || got[2] != "A" {
+		t.Errorf("pairs = %v, want pg 1→B and pg 2→A", got)
+	}
+}
+
+// A row that names its session never falls back to another session's
+// request, even when that one is the only tuple match in the window.
+func TestSessionIDNoCrossSessionFallback(t *testing.T) {
+	srcID = 0
+	st := testStore(t)
+	seedRequest(t, st, "A", t0, 700, 50, 0, 9000)
+
+	src := &fakeSource{rows: []Row{sessRow(1, t0, "sess-other")}}
+	stats, err := (&Ingester{Src: src}).Run(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Matched != 0 || stats.Unmatched != 1 {
+		t.Errorf("stats = %+v, want Matched=0 Unmatched=1", stats)
+	}
+	// Its own transcript lands later and pairs on the next pass.
+	seedRequest(t, st, "other", t0.Add(time.Minute), 700, 50, 0, 9000)
+	if matched, _, err := st.MatchGwRequests(); err != nil || matched != 1 {
+		t.Fatalf("late match = %d, %v; want 1", matched, err)
+	}
+	if got := pairs(t, st); got[1] != "other" {
+		t.Errorf("pairs = %v, want pg 1→other", got)
+	}
+}
+
+// pairs maps gw pg_id → the transcript request key it paired with.
+func pairs(t *testing.T, st *store.Store) map[int64]string {
+	t.Helper()
+	out := map[int64]string{}
+	// A second connection: the store holds its only one.
+	db, err := sql.Open("sqlite", st.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT pg_id, request_key FROM gw_request WHERE request_key != ''`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var key string
+		if err := rows.Scan(&id, &key); err != nil {
+			t.Fatal(err)
+		}
+		out[id] = key
+	}
+	return out
 }

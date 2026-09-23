@@ -7,8 +7,11 @@
 // cursor is MAX(pg_id) already stored for the source, so re-runs only fetch
 // new rows and re-ingests are no-ops via the dedupe key. After each pull the
 // store's MatchGwRequests pairs anthropic-class rows with transcript request
-// rows by usage tuple + time proximity — the router never sees harness
-// session ids, so the wire and transcript views only meet through inference.
+// rows by usage tuple + time proximity, within the row's own harness session
+// when the router logged one (router_requests.session_id, llm-router-go
+// f00737c+). Older routers have no such column; Fetch detects that once and
+// reads an empty id instead, so tokenator keeps working against an
+// un-upgraded origin.
 //
 // Facts this ingester relies on (llm-router-go v0.6.1, internal/router/reqlog):
 //   - one row per request, id BIGSERIAL, ts TIMESTAMPTZ at request start;
@@ -60,6 +63,7 @@ type Row struct {
 	CacheRead       *int64
 	PrefixHashChain string
 	Error           string
+	SessionID       string // caller's harness session id; '' when absent
 }
 
 // Source yields reqlog rows after a cursor. Root identifies the origin for
@@ -172,6 +176,7 @@ func toGwRequest(sourceID int64, root string, r Row) store.GwRequest {
 		PrefixHashChain:     r.PrefixHashChain,
 		ChainLen:            chainLen,
 		Error:               r.Error,
+		SessionID:           r.SessionID,
 		DedupeKey:           fmt.Sprintf("%s#%d", root, r.ID),
 	}
 }
@@ -182,6 +187,9 @@ func toGwRequest(sourceID int64, root string, r Row) store.GwRequest {
 type PGSource struct {
 	db   *sql.DB
 	root string
+	// sessionCol is the SELECT expression for the session id: the column
+	// when the origin has it, else a constant ''. Resolved on first Fetch.
+	sessionCol string
 }
 
 func OpenPG(ctx context.Context, dsn string) (*PGSource, error) {
@@ -205,7 +213,32 @@ func OpenPG(ctx context.Context, dsn string) (*PGSource, error) {
 func (p *PGSource) Root() string { return p.root }
 func (p *PGSource) Close() error { return p.db.Close() }
 
+// resolveSessionCol checks once whether router_requests has session_id, so a
+// pull against a router that predates it selects an empty id rather than
+// failing.
+func (p *PGSource) resolveSessionCol(ctx context.Context) error {
+	if p.sessionCol != "" {
+		return nil
+	}
+	var n int
+	err := p.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_name = 'router_requests' AND column_name = 'session_id'
+		  AND table_schema = ANY (current_schemas(false))`).Scan(&n)
+	if err != nil {
+		return fmt.Errorf("reqlog: probe session_id column: %w", err)
+	}
+	p.sessionCol = "''"
+	if n > 0 {
+		p.sessionCol = "COALESCE(session_id, '')"
+	}
+	return nil
+}
+
 func (p *PGSource) Fetch(ctx context.Context, afterID int64, limit int) ([]Row, error) {
+	if err := p.resolveSessionCol(ctx); err != nil {
+		return nil, err
+	}
 	rows, err := p.db.QueryContext(ctx, `
 		SELECT id, COALESCE(request_id, ''), ts, method, path, model,
 			COALESCE(backend_model, ''), COALESCE(backend_url, ''),
@@ -213,7 +246,8 @@ func (p *PGSource) Fetch(ctx context.Context, afterID int64, limit int) ([]Row, 
 			via_tool_proxy, stream, status, latency_ms,
 			prompt_tokens, completion_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
-			COALESCE(prefix_hash_chain, ''), COALESCE(error, '')
+			COALESCE(prefix_hash_chain, ''), COALESCE(error, ''),
+			`+p.sessionCol+`
 		FROM router_requests
 		WHERE id > $1
 		ORDER BY id
@@ -230,7 +264,7 @@ func (p *PGSource) Fetch(ctx context.Context, afterID int64, limit int) ([]Row, 
 			&r.ViaToolProxy, &r.Stream, &r.Status, &r.LatencyMS,
 			&r.PromptTokens, &r.CompletionToks,
 			&r.CacheCreation, &r.CacheRead,
-			&r.PrefixHashChain, &r.Error); err != nil {
+			&r.PrefixHashChain, &r.Error, &r.SessionID); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
