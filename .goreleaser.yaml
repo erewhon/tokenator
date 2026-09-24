@@ -65,12 +65,15 @@ homebrew_casks:
       email: noreply@byrnes.org
     # The binary is unsigned: strip the Gatekeeper quarantine bit on install so
     # it runs without a "developer cannot be verified" prompt.
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/tokenator"]
-          end
+    # Homebrew 7 deprecates `postflight` blocks (what hooks.post.install
+    # renders) for declarative `postflight_steps`; GoReleaser has no steps
+    # option, so the stanza goes in custom_block. chdir "." is the staged path.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "tokenator"], chdir: "."
+        end
+      end
     caveats: |
       Quick start:
         tokenator ingest    # profile your Claude Code / OpenCode transcripts
