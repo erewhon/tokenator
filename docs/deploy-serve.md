@@ -75,6 +75,19 @@ Constraints for the front-door wiring:
 - Responses can be large (a transcript page can be several MB); don't set
   tight proxy body/response limits.
 
+## Behind the router dashboard
+
+The router dashboard reverse-proxies tokenator at `/tokens/` (llm-router-go
+`--dashboard-tokens-url`). Nothing to configure here: the proxy strips the
+prefix and announces it with `X-Forwarded-Prefix`, and every URL a page
+emits carries it. A proxy that keeps the prefix instead needs
+`serve --base-path /tokens`. The dashboard's Tokens tab loads pages with
+`?embed=1` (sticky via cookie; `X-Tokenator-Embed: 1` works too), which
+drops tokenator's own chrome, repaints the palette to the dashboard's, and
+turns "router requests" / "catalog" links into `postMessage` jumps
+(`{type:"tokenator-jump", tab, session|model}`) the shell routes through its
+hash grammar. Standalone pages are unchanged.
+
 ## Data freshness (optional but recommended)
 
 `serve` only reads the DB; ingestion is separate. Today ingest runs
