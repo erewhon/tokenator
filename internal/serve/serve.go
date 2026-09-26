@@ -56,6 +56,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /session/{key}", s.handleSession)
 	mux.HandleFunc("GET /session/{key}/transcript", s.handleTranscript)
 	mux.HandleFunc("GET /model/{name}", s.handleModel)
+	s.apiRoutes(mux)
 	base := cleanBase(s.BasePath)
 	if base == "" {
 		return mux
@@ -96,7 +97,8 @@ type hitView struct {
 	Kind    string
 	Slot    int
 	Tool    string
-	Snippet template.HTML
+	Snippet template.HTML // highlighted, for the page
+	Raw     string        // plain, for the API
 }
 
 type indexData struct {
@@ -115,44 +117,70 @@ type indexData struct {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	q := strings.TrimSpace(r.FormValue("q"))
-	project := r.FormValue("project")
-	since := r.FormValue("since")
+	data, err := s.buildIndex(r.FormValue("q"), r.FormValue("project"), r.FormValue("since"), 0)
+	if err != nil {
+		http.Error(w, err.Error(), err.status())
+		return
+	}
+	pg := s.pageOf(w, r)
+	data.Page, data.Head = pg, embedHead(pg)
+	render(w, indexTmpl, data)
+}
+
+// httpErr is an error with the status the HTML and JSON handlers both send.
+type httpErr struct {
+	code int
+	err  error
+}
+
+func (e *httpErr) Error() string { return e.err.Error() }
+func (e *httpErr) status() int   { return e.code }
+
+func badRequest(err error) *httpErr { return &httpErr{http.StatusBadRequest, err} }
+func notFound(err error) *httpErr   { return &httpErr{http.StatusNotFound, err} }
+func internal(err error) *httpErr   { return &httpErr{http.StatusInternalServerError, err} }
+
+// buildIndex is the session browser's data: the newest sessions under the
+// filters, or — with a query — the content-scanned matches. limit 0 means
+// the page defaults (100 listed, ScanLimit scanned). Shared by the HTML
+// page and /api/sessions so the two cannot drift.
+func (s *Server) buildIndex(q, project, since string, limit int) (indexData, *httpErr) {
+	q = strings.TrimSpace(q)
 	sinceTS, err := parseSince(since)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return indexData{}, badRequest(err)
 	}
 	projects, err := s.Store.Projects()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return indexData{}, internal(err)
 	}
-
-	pg := s.pageOf(w, r)
-	data := indexData{Page: pg, Head: embedHead(pg), Query: q, Project: project, Since: since, Projects: projects}
+	data := indexData{Query: q, Project: project, Since: since, Projects: projects}
 	if q == "" {
-		list, err := s.Store.SessionList(store.SessionFilter{Project: project, SinceTS: sinceTS, Limit: 100})
+		if limit <= 0 {
+			limit = 100
+		}
+		list, err := s.Store.SessionList(store.SessionFilter{Project: project, SinceTS: sinceTS, Limit: limit})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return indexData{}, internal(err)
 		}
 		data.Rows = decorate(list)
-	} else {
-		data.Searched = true
-		data.Limit = s.scanLimit()
-		list, err := s.Store.SessionList(store.SessionFilter{Project: project, SinceTS: sinceTS, Limit: data.Limit})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		data.Scanned = len(list)
-		data.Truncated = len(list) == data.Limit
-		start := time.Now()
-		data.Rows = s.searchSessions(list, q)
-		data.ScanMS = time.Since(start).Milliseconds()
+		return data, nil
 	}
-	render(w, indexTmpl, data)
+	data.Searched = true
+	data.Limit = s.scanLimit()
+	if limit > 0 {
+		data.Limit = limit
+	}
+	list, err := s.Store.SessionList(store.SessionFilter{Project: project, SinceTS: sinceTS, Limit: data.Limit})
+	if err != nil {
+		return indexData{}, internal(err)
+	}
+	data.Scanned = len(list)
+	data.Truncated = len(list) == data.Limit
+	start := time.Now()
+	data.Rows = s.searchSessions(list, q)
+	data.ScanMS = time.Since(start).Milliseconds()
+	return data, nil
 }
 
 // searchSessions content-scans the candidates in parallel, keeping rows that
@@ -177,7 +205,7 @@ func (s *Server) searchSessions(list []store.SessionListRow, q string) []session
 				snip, _ := highlight(h.Snippet, q)
 				row.Hits = append(row.Hits, hitView{
 					Anchor: h.EntryIdx, TS: minuteTS(h.TS), Kind: h.Kind,
-					Slot: kindSlots[h.Kind], Tool: h.Tool, Snippet: snip,
+					Slot: kindSlots[h.Kind], Tool: h.Tool, Snippet: snip, Raw: h.Snippet,
 				})
 			}
 		}(&rows[i])
@@ -233,15 +261,26 @@ type modelData struct {
 // a registry id or a harness model name. An unknown name is an empty page,
 // not a 404: "nothing used it" is an answer.
 func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	const limit = 100
-	list, tot, err := s.Store.ModelSessions(name, limit)
+	data, err := s.buildModel(r.PathValue("name"), 0)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), err.status())
 		return
 	}
 	pg := s.pageOf(w, r)
-	data := modelData{Page: pg, Head: embedHead(pg), Name: name, Totals: tot, Limit: limit, Trimmed: len(list) == limit,
+	data.Page, data.Head = pg, embedHead(pg)
+	render(w, modelTmpl, data)
+}
+
+// buildModel is the per-model page's data (limit 0 = 100 newest sessions).
+func (s *Server) buildModel(name string, limit int) (modelData, *httpErr) {
+	if limit <= 0 {
+		limit = 100
+	}
+	list, tot, err := s.Store.ModelSessions(name, limit)
+	if err != nil {
+		return modelData{}, internal(err)
+	}
+	data := modelData{Name: name, Totals: tot, Limit: limit, Trimmed: len(list) == limit,
 		GwToks: abbrev(tot.Input + tot.Output), GwOut: abbrev(tot.Output)}
 	for _, l := range list {
 		data.Rows = append(data.Rows, modelRow{
@@ -251,7 +290,7 @@ func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
 			OutToks:         abbrev(l.Output),
 		})
 	}
-	render(w, modelTmpl, data)
+	return data, nil
 }
 
 // --- session profile (existing page + nav) ---
@@ -323,26 +362,34 @@ var kindSlots = map[string]int{
 
 const collapseOver = 1200 // chars; longer bodies start folded
 
+// loadTranscript resolves a session (by key or prefix) and loads its
+// entries. A missing transcript file is not an error here: meta is still
+// good, entries are empty and loadErr says why.
+func (s *Server) loadTranscript(key string) (meta store.SessionMeta, entries []transcript.Entry, loadErr string, err *httpErr) {
+	meta, e := s.Store.SessionByPrefix(key)
+	if e != nil {
+		return meta, nil, "", notFound(e)
+	}
+	kind, root, e := s.Store.SessionSource(meta.ID)
+	if e != nil {
+		return meta, nil, "", internal(e)
+	}
+	entries, e = transcript.Load(kind, root, meta.Key)
+	if e != nil {
+		loadErr = e.Error()
+	}
+	return meta, entries, loadErr, nil
+}
+
 func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key")
 	q := strings.TrimSpace(r.FormValue("q"))
-	meta, err := s.Store.SessionByPrefix(key)
+	meta, entries, loadErr, err := s.loadTranscript(r.PathValue("key"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		http.Error(w, err.Error(), err.status())
 		return
 	}
 	pg := s.pageOf(w, r)
-	data := transcriptData{Page: pg, Head: embedHead(pg), Meta: meta, Query: q, MonitorURL: s.MonitorURL}
-	kind, root, err := s.Store.SessionSource(meta.ID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	entries, err := transcript.Load(kind, root, meta.Key)
-	if err != nil {
-		data.Err = err.Error()
-	}
-	data.Total = len(entries)
+	data := transcriptData{Page: pg, Head: embedHead(pg), Meta: meta, Query: q, MonitorURL: s.MonitorURL, Err: loadErr, Total: len(entries)}
 	prevDay := ""
 	for _, e := range entries {
 		te := transcriptEntry{
