@@ -51,11 +51,11 @@ var indexTmpl = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tokenator — sessions</title>
 ` + favicon + `
-<style>` + report.BaseCSS + serveCSS + `</style></head>
+<style>` + report.BaseCSS + serveCSS + `</style>{{.Head}}</head>
 <body class="viz-root">
 <div class="card">
-  <h1>tokenator — sessions</h1>
-  <form class="filters" method="get" action="/">
+  {{if not .Page.Embed}}<h1>tokenator — sessions</h1>{{end}}
+  <form class="filters" method="get" action="{{.Page.Base}}/">
     <input type="text" name="q" value="{{.Query}}" placeholder="search session content…" autofocus>
     <select name="project">
       <option value="">all projects</option>
@@ -78,16 +78,16 @@ var indexTmpl = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 {{if .Searched}}
   {{range .Rows}}
   <div class="card">
-    <p style="margin:0"><a class="title" href="/session/{{.Key}}/transcript?q={{$.Query}}">{{if .Title}}{{.Title}}{{else}}{{.Key}}{{end}}</a>
+    <p style="margin:0"><a class="title" href="{{$.Page.Base}}/session/{{.Key}}/transcript?q={{$.Query}}">{{if .Title}}{{.Title}}{{else}}{{.Key}}{{end}}</a>
       {{if .Agent}}<span class="agent">agent: {{.Agent}}</span>{{end}}</p>
     <p class="meta">{{.When}} · {{.Project}} · {{.Requests}} req · {{.TotalToks}} toks
       · {{if .Matches}}{{.Matches}} match{{if ne .Matches 1}}es{{end}}{{else}}title match{{end}}
-      · <a href="/session/{{.Key}}">profile</a>
+      · <a href="{{$.Page.Base}}/session/{{.Key}}">profile</a>
       {{if .ScanErr}}· <span class="agent">transcript unavailable: {{.ScanErr}}</span>{{end}}</p>
     {{$row := .}}{{if .Hits}}<ul class="snips">
       {{range .Hits}}<li><span class="t">{{.TS}}</span><span class="chip s{{.Slot}}">{{.Kind}}</span>
         {{if .Tool}}<span class="t">{{.Tool}}</span>{{end}}
-        <a href="/session/{{$row.Key}}/transcript?q={{$.Query}}#e{{.Anchor}}">¶</a>
+        <a href="{{$.Page.Base}}/session/{{$row.Key}}/transcript?q={{$.Query}}#e{{.Anchor}}">¶</a>
         {{.Snippet}}</li>{{end}}
     </ul>{{end}}
   </div>
@@ -101,18 +101,18 @@ var indexTmpl = template.Must(template.New("index").Parse(`<!DOCTYPE html>
     {{range .Rows}}<tr>
       <td class="when">{{.When}}</td>
       <td>{{.Project}}</td>
-      <td><a class="title" href="/session/{{.Key}}/transcript">{{if .Title}}{{.Title}}{{else}}{{.Key}}{{end}}</a>
+      <td><a class="title" href="{{$.Page.Base}}/session/{{.Key}}/transcript">{{if .Title}}{{.Title}}{{else}}{{.Key}}{{end}}</a>
         {{if .Agent}}<span class="agent">· {{.Agent}}</span>{{end}}</td>
       <td class="n">{{.Requests}}</td>
       <td class="n">{{.TotalToks}}</td>
       <td class="n">{{.OutToks}}</td>
-      <td><a href="/session/{{.Key}}">profile</a></td>
+      <td><a href="{{$.Page.Base}}/session/{{.Key}}">profile</a></td>
     </tr>{{end}}
   </table>
   {{if not .Rows}}<p class="muted">no sessions — run tokenator ingest first</p>{{end}}
 </div>
 {{end}}
-<footer>tokenator serve · content search reads the harness transcript files on demand; nothing leaves this machine</footer>
+{{if not .Page.Embed}}<footer>tokenator serve · content search reads the harness transcript files on demand; nothing leaves this machine</footer>{{end}}
 </body></html>
 `))
 
@@ -121,10 +121,10 @@ var modelTmpl = template.Must(template.New("model").Parse(`<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tokenator — model {{.Name}}</title>
 ` + favicon + `
-<style>` + report.BaseCSS + serveCSS + `</style></head>
+<style>` + report.BaseCSS + serveCSS + `</style>{{.Head}}</head>
 <body class="viz-root">
 <div class="card">
-  <p class="meta" style="margin-bottom:6px"><a href="/">&larr; sessions</a></p>
+  <p class="meta" style="margin-bottom:6px">{{if .Page.Embed}}<a href="#" data-jump="catalog" data-model="{{.Name}}">catalog</a>{{else}}<a href="{{.Page.Base}}/">&larr; sessions</a>{{end}}</p>
   <h1>model {{.Name}}</h1>
   <p class="meta">{{len .Rows}} session{{if ne (len .Rows) 1}}s{{end}}{{if .Trimmed}} (newest {{.Limit}}){{end}}
     · router: {{.Totals.Requests}} req · {{.GwToks}} toks · {{.GwOut}} out{{if .Totals.Unpaired}} · {{.Totals.Unpaired}} not attributed to a session{{end}}</p>
@@ -136,17 +136,17 @@ var modelTmpl = template.Must(template.New("model").Parse(`<!DOCTYPE html>
     {{range .Rows}}<tr>
       <td class="when">{{.When}}</td>
       <td>{{.Project}}</td>
-      <td><a class="title" href="/session/{{.Key}}/transcript">{{if .Title}}{{.Title}}{{else}}{{.Key}}{{end}}</a>
+      <td><a class="title" href="{{$.Page.Base}}/session/{{.Key}}/transcript">{{if .Title}}{{.Title}}{{else}}{{.Key}}{{end}}</a>
         {{if .Agent}}<span class="agent">· {{.Agent}}</span>{{end}}</td>
       <td class="n">{{.Requests}}</td>
       <td class="n">{{.TotalToks}}</td>
       <td class="n">{{.OutToks}}</td>
       <td><span class="agent">{{.Via}}</span></td>
-      <td><a href="/session/{{.Key}}">profile</a></td>
+      <td><a href="{{$.Page.Base}}/session/{{.Key}}">profile</a></td>
     </tr>{{end}}
   </table>{{else}}<p class="muted">no session used {{.Name}} — neither a transcript nor the router log names it</p>{{end}}
 </div>
-<footer>tokenator serve · matched on the harness's model name, the router alias the caller sent, and the registry id it resolved to</footer>
+{{if not .Page.Embed}}<footer>tokenator serve · matched on the harness's model name, the router alias the caller sent, and the registry id it resolved to</footer>{{end}}
 </body></html>
 `))
 
@@ -155,11 +155,12 @@ var transcriptTmpl = template.Must(template.New("transcript").Parse(`<!DOCTYPE h
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tokenator — transcript {{.Meta.Key}}</title>
 ` + favicon + `
-<style>` + report.BaseCSS + serveCSS + `</style></head>
+<style>` + report.BaseCSS + serveCSS + `</style>{{.Head}}</head>
 <body class="viz-root">
 <div class="card">
-  <p class="meta" style="margin-bottom:6px"><a href="/">&larr; sessions</a> &middot;
-    <a href="/session/{{.Meta.Key}}">profile</a>{{if .MonitorURL}} &middot; <a href="{{.MonitorURL}}" title="agent-monitor board">monitor</a>{{end}}</p>
+  <p class="meta" style="margin-bottom:6px">{{if .Page.Embed}}<a href="{{.Page.Base}}/session/{{.Meta.Key}}">profile</a> &middot;
+    <a href="#" data-jump="requests" data-session="{{.Meta.Key}}">router requests</a>{{else}}<a href="{{.Page.Base}}/">&larr; sessions</a> &middot;
+    <a href="{{.Page.Base}}/session/{{.Meta.Key}}">profile</a>{{if .MonitorURL}} &middot; <a href="{{.MonitorURL}}" title="agent-monitor board">monitor</a>{{end}}{{end}}</p>
   <h1>{{.Meta.Project}}{{if .Meta.Title}} — {{.Meta.Title}}{{end}}</h1>
   <p class="meta">session {{.Meta.Key}}{{if .Meta.Agent}} · agent: {{.Meta.Agent}}{{end}}
     · {{.Total}} entries</p>
@@ -186,6 +187,6 @@ var transcriptTmpl = template.Must(template.New("transcript").Parse(`<!DOCTYPE h
   </div>
   {{end}}
 </div>
-<footer>tokenator serve · rendered from the harness transcript files</footer>
+{{if not .Page.Embed}}<footer>tokenator serve · rendered from the harness transcript files</footer>{{end}}
 </body></html>
 `))

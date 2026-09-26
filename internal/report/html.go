@@ -31,10 +31,26 @@ func RenderSessionHTML(w io.Writer, v *SessionView) error {
 // RenderSessionHTMLNav is RenderSessionHTML with a trusted navigation
 // fragment injected at the top of the page (used by serve mode).
 func RenderSessionHTMLNav(w io.Writer, v *SessionView, nav template.HTML) error {
+	return RenderSessionHTMLOpts(w, v, PageOpts{Nav: nav})
+}
+
+// PageOpts are serve mode's additions to the session page: a trusted nav
+// fragment at the top of the body and a trusted <head> fragment (extra
+// styles/scripts, e.g. the embedded-mode palette).
+type PageOpts struct {
+	Nav  template.HTML
+	Head template.HTML
+}
+
+// RenderSessionHTMLOpts renders the session page with serve mode's
+// additions.
+func RenderSessionHTMLOpts(w io.Writer, v *SessionView, o PageOpts) error {
+	nav := o.Nav
 	data := struct {
 		V              *SessionView
 		Label          string
 		Nav            template.HTML
+		Head           template.HTML
 		Chart1, Chart2 template.HTML
 		DataJSON       template.JS
 		ReusePct       string
@@ -45,6 +61,7 @@ func RenderSessionHTMLNav(w io.Writer, v *SessionView, nav template.HTML) error 
 		V:         v,
 		Label:     sessionLabel(v),
 		Nav:       nav,
+		Head:      o.Head,
 		Chart1:    template.HTML(buildTimelineSVG(v)),
 		Chart2:    template.HTML(buildCompositionSVG(v)),
 		DataJSON:  template.JS(buildChartJSON(v)),
@@ -362,7 +379,7 @@ const sessionPageTmpl = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tokenator — {{.Label}}</title>
-<style>` + BaseCSS + `</style></head>
+<style>` + BaseCSS + `</style>{{.Head}}</head>
 <body class="viz-root">
 {{.Nav}}
 <div class="card">

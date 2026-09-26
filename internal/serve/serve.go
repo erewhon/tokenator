@@ -34,6 +34,11 @@ type Server struct {
 	// ScanLimit bounds how many sessions a content search will scan
 	// (newest first). 0 means 80.
 	ScanLimit int
+	// BasePath is the prefix the site is served under when a proxy in front
+	// does NOT strip it (e.g. "/tokens"); see page.go. The router dashboard's
+	// proxy strips and announces its prefix per request instead, which needs
+	// no flag.
+	BasePath string
 }
 
 func (s *Server) scanLimit() int {
@@ -43,14 +48,25 @@ func (s *Server) scanLimit() int {
 	return s.ScanLimit
 }
 
-// Handler returns the route table.
+// Handler returns the route table: root-relative, and additionally mounted
+// under BasePath when one is set (a prefix-preserving proxy in front).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("GET /session/{key}", s.handleSession)
 	mux.HandleFunc("GET /session/{key}/transcript", s.handleTranscript)
 	mux.HandleFunc("GET /model/{name}", s.handleModel)
-	return mux
+	base := cleanBase(s.BasePath)
+	if base == "" {
+		return mux
+	}
+	outer := http.NewServeMux()
+	outer.Handle(base+"/", http.StripPrefix(base, mux))
+	outer.HandleFunc(base, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, base+"/", http.StatusMovedPermanently)
+	})
+	outer.Handle("/", mux)
+	return outer
 }
 
 func (s *Server) ListenAndServe(addr string) error {
@@ -84,6 +100,8 @@ type hitView struct {
 }
 
 type indexData struct {
+	Page      page
+	Head      template.HTML
 	Query     string
 	Project   string
 	Since     string
@@ -111,7 +129,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data := indexData{Query: q, Project: project, Since: since, Projects: projects}
+	pg := s.pageOf(w, r)
+	data := indexData{Page: pg, Head: embedHead(pg), Query: q, Project: project, Since: since, Projects: projects}
 	if q == "" {
 		list, err := s.Store.SessionList(store.SessionFilter{Project: project, SinceTS: sinceTS, Limit: 100})
 		if err != nil {
@@ -199,6 +218,8 @@ type modelRow struct {
 }
 
 type modelData struct {
+	Page    page
+	Head    template.HTML
 	Name    string
 	Rows    []modelRow
 	Totals  store.ModelTotals
@@ -219,7 +240,8 @@ func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	data := modelData{Name: name, Totals: tot, Limit: limit, Trimmed: len(list) == limit,
+	pg := s.pageOf(w, r)
+	data := modelData{Page: pg, Head: embedHead(pg), Name: name, Totals: tot, Limit: limit, Trimmed: len(list) == limit,
 		GwToks: abbrev(tot.Input + tot.Output), GwOut: abbrev(tot.Output)}
 	for _, l := range list {
 		data.Rows = append(data.Rows, modelRow{
@@ -241,10 +263,20 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	nav := fmt.Sprintf(
-		`<p class="meta" style="max-width:960px;margin:0 auto 12px"><a href="/">&larr; sessions</a> &middot; <a href="/session/%s/transcript">transcript</a>%s</p>`,
-		url.PathEscape(view.Meta.Key), s.monitorLink())
-	if err := report.RenderSessionHTMLNav(w, view, template.HTML(nav)); err != nil {
+	pg := s.pageOf(w, r)
+	var nav string
+	if pg.Embed {
+		// No site chrome inside the dashboard; the transcript link stays,
+		// plus a jump to this session's router requests.
+		nav = fmt.Sprintf(
+			`<p class="meta" style="margin:0 0 12px"><a href="%s/session/%s/transcript">transcript</a> &middot; <a href="#" data-jump="requests" data-session="%s">router requests</a></p>`,
+			pg.Base, url.PathEscape(view.Meta.Key), template.HTMLEscapeString(view.Meta.Key))
+	} else {
+		nav = fmt.Sprintf(
+			`<p class="meta" style="max-width:960px;margin:0 auto 12px"><a href="%s/">&larr; sessions</a> &middot; <a href="%s/session/%s/transcript">transcript</a>%s</p>`,
+			pg.Base, pg.Base, url.PathEscape(view.Meta.Key), s.monitorLink())
+	}
+	if err := report.RenderSessionHTMLOpts(w, view, report.PageOpts{Nav: template.HTML(nav), Head: embedHead(pg)}); err != nil {
 		log.Printf("serve: render session %s: %v", key, err)
 	}
 }
@@ -265,6 +297,8 @@ type transcriptEntry struct {
 }
 
 type transcriptData struct {
+	Page       page
+	Head       template.HTML
 	Meta       store.SessionMeta
 	Query      string
 	Entries    []transcriptEntry
@@ -297,7 +331,8 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	data := transcriptData{Meta: meta, Query: q, MonitorURL: s.MonitorURL}
+	pg := s.pageOf(w, r)
+	data := transcriptData{Page: pg, Head: embedHead(pg), Meta: meta, Query: q, MonitorURL: s.MonitorURL}
 	kind, root, err := s.Store.SessionSource(meta.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
