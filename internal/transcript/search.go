@@ -92,6 +92,9 @@ func rawMatch(sourceKind, root, sessionKey, query string) (bool, error) {
 		}
 		return false, nil
 	case "opencode":
+		if isOpenCodeDB(root) {
+			return rawMatchOpenCodeDB(root, sessionKey, needle)
+		}
 		// Messages carry no content; scan the session's part files.
 		msgPaths, err := filepath.Glob(filepath.Join(root, "message", sessionKey, "*.json"))
 		if err != nil {
