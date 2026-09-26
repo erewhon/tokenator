@@ -760,32 +760,49 @@ func (s *Store) MaxGwPGID(sourceID int64) (int64, error) {
 // for many minutes — because the usage tuple carries the real signal.
 const gwMatchWindowMinutes = 30.0
 
-// MatchGwRequests pairs anthropic-class gateway rows with transcript request
-// rows. The router's request_id is its own (Claude Code sends no
-// X-Request-ID), so the join is inferred: a transcript request with the
-// exact same usage tuple (input, output, cache_creation, cache_read) within
-// the time window, closest timestamp first, each transcript request claimed
-// at most once. When the gateway row carries the harness session id
-// (schemaV7), candidates are restricted to that session's requests — two
-// concurrent sessions can no longer cross-pair — and there is no fallback
-// to other sessions: a row whose session has no match yet stays unmatched
-// until its transcript is ingested. Subagent (sidechain) requests share the
-// parent's session id in both views, so they need no special case. Collisions are
+// MatchGwRequests pairs gateway rows with transcript request rows. The
+// router's request_id is its own (Claude Code sends no X-Request-ID), so the
+// join is inferred: a transcript request with the exact same usage tuple
+// (input, output, cache_creation, cache_read) within the time window,
+// closest timestamp first, each transcript request claimed at most once.
+// When the gateway row carries the harness session id (schemaV7),
+// candidates are restricted to that session's requests — two concurrent
+// sessions can no longer cross-pair — and there is no fallback to other
+// sessions: a row whose session has no match yet stays unmatched until its
+// transcript is ingested. Subagent (sidechain) requests share the parent's
+// session id in both views, so they need no special case. Collisions are
 // effectively impossible for real prompts; tiny look-alike utility calls
 // could in principle cross-pair, which is harmless for attribution.
+//
+// Two API classes take part:
+//
+//   - anthropic (Claude Code): with or without a session id, as above.
+//   - chat (opencode, since the router logs its ses_… id): ONLY rows that
+//     carry a session id, and only within that session — chat traffic
+//     without a session id is anything from a curl to a pipeline, and
+//     inferring across sessions there would mostly be wrong. The router
+//     logs prompt/completion tokens and cached prompt tokens; opencode
+//     records the same numbers (verified live 2026-09-26, cache 0 on both
+//     sides). Providers that report cached tokens may make opencode count
+//     input net of cache while the router logs the gross prompt, so a chat
+//     row with no exact match falls back to same session, same output, and
+//     the transcript's input+cache_read equal to the router's prompt
+//     (gross) or prompt+cached (if a provider reports a net prompt),
+//     nearest timestamp.
+//
 // Unmatched gateway rows are expected and interesting: requests the harness
-// never wrote to a transcript (count_tokens probes, quota pings, other
-// machines' traffic).
+// never wrote to a transcript (count_tokens probes, quota pings, opencode's
+// title/summary side calls, other machines' traffic).
 //
 // Returns how many rows were newly matched and how many usage-bearing
-// anthropic rows remain unmatched. Idempotent; call after every ingest (new
+// candidate rows remain unmatched. Idempotent; call after every ingest (new
 // gateway rows and new transcript rows both create match opportunities).
 func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
 	type cand struct {
 		id                  int64
 		ts                  string
 		in, out, ccre, cred int64
-		session             string
+		session, class      string
 	}
 	// One short read for the pending set, then short write transactions per
 	// chunk: a long read-then-write transaction would fail with
@@ -795,17 +812,18 @@ func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
 	rows, err := s.db.Query(`
 		SELECT id, ts, input_tokens, output_tokens,
 			COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0),
-			session_id
+			session_id, api_class
 		FROM gw_request
-		WHERE request_key = '' AND api_class = 'anthropic' AND status = 200
+		WHERE request_key = '' AND status = 200
 		  AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL
+		  AND (api_class = 'anthropic' OR (api_class = 'chat' AND session_id != ''))
 		ORDER BY ts`)
 	if err != nil {
 		return 0, 0, err
 	}
 	for rows.Next() {
 		var c cand
-		if err := rows.Scan(&c.id, &c.ts, &c.in, &c.out, &c.ccre, &c.cred, &c.session); err != nil {
+		if err := rows.Scan(&c.id, &c.ts, &c.in, &c.out, &c.ccre, &c.cred, &c.session, &c.class); err != nil {
 			rows.Close()
 			return 0, 0, err
 		}
@@ -839,6 +857,21 @@ func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
 					LIMIT 1`,
 					c.in, c.out, c.ccre, c.cred, c.ts, gwMatchWindowMinutes,
 					c.session, c.session, c.ts).Scan(&key)
+				if err == sql.ErrNoRows && c.class == "chat" {
+					// Cached-token accounting may differ between the router
+					// (gross prompt) and opencode (net of cache): same
+					// session, same output, same prompt total.
+					err = t.tx.QueryRow(`
+						SELECT r.dedupe_key FROM request r
+						WHERE r.output_tokens = ?
+						  AND r.input_tokens + r.cache_read_tokens IN (?, ?)
+						  AND ABS(julianday(r.ts) - julianday(?)) * 1440.0 <= ?
+						  AND NOT EXISTS (SELECT 1 FROM gw_request g WHERE g.request_key = r.dedupe_key)
+						  AND r.session_id IN (SELECT id FROM session WHERE harness_session_id = ?)
+						ORDER BY ABS(julianday(r.ts) - julianday(?))
+						LIMIT 1`,
+						c.out, c.in, c.in+c.cred, c.ts, gwMatchWindowMinutes, c.session, c.ts).Scan(&key)
+				}
 				if err == sql.ErrNoRows {
 					u++
 					continue
