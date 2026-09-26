@@ -287,3 +287,105 @@ func pairs(t *testing.T, st *store.Store) map[int64]string {
 	}
 	return out
 }
+
+// chatRow is an opencode-style /v1/chat/completions row: the router logs
+// prompt/completion tokens and, when the provider reports them, cached
+// prompt tokens; there is no cache-creation figure for chat.
+func chatRow(id int64, ts time.Time, session string, in, out int64, cached *int64) Row {
+	return Row{
+		ID: id, RequestID: "c16chars", TS: ts, Method: "POST", Path: "/v1/chat/completions",
+		Model: "lightning", BackendURL: "http://talos:5391", ResolvedVia: "static",
+		APIClass: "chat", Stream: true, Status: 200, LatencyMS: 900,
+		PromptTokens: iptr(in), CompletionToks: iptr(out), CacheRead: cached,
+		SessionID: session,
+	}
+}
+
+// Two concurrent opencode sessions send the same usage tuple; each gateway
+// row pairs inside the session its ses_… id names, whatever the timing.
+func TestChatPairsWithinSession(t *testing.T) {
+	srcID = 0
+	st := testStore(t)
+	seedRequest(t, st, "ocA", t0.Add(10*time.Second), 35103, 38, 0, 0)
+	seedRequest(t, st, "ocB", t0.Add(20*time.Second), 35103, 38, 0, 0)
+
+	src := &fakeSource{rows: []Row{
+		chatRow(1, t0.Add(9*time.Second), "sess-ocB", 35103, 38, nil),
+		chatRow(2, t0.Add(21*time.Second), "sess-ocA", 35103, 38, nil),
+	}}
+	stats, err := (&Ingester{Src: src}).Run(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Matched != 2 || stats.Unmatched != 0 {
+		t.Fatalf("stats = %+v, want Matched=2", stats)
+	}
+	if got := pairs(t, st); got[1] != "ocB" || got[2] != "ocA" {
+		t.Errorf("pairs = %v, want pg 1→ocB and pg 2→ocA", got)
+	}
+}
+
+// A chat row with no session id is never paired, even when a transcript
+// request with the identical tuple sits right next to it: chat traffic
+// without a session is curl, pipelines, other machines.
+func TestChatWithoutSessionStaysUnpaired(t *testing.T) {
+	srcID = 0
+	st := testStore(t)
+	seedRequest(t, st, "ocA", t0, 35103, 38, 0, 0)
+
+	src := &fakeSource{rows: []Row{chatRow(1, t0, "", 35103, 38, nil)}}
+	stats, err := (&Ingester{Src: src}).Run(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Matched != 0 {
+		t.Fatalf("stats = %+v, want Matched=0", stats)
+	}
+	if got := pairs(t, st); len(got) != 0 {
+		t.Errorf("pairs = %v, want none", got)
+	}
+	// It is not a candidate at all, so it does not count as unmatched either.
+	if stats.Unmatched != 0 {
+		t.Errorf("Unmatched = %d, want 0 (session-less chat rows are not candidates)", stats.Unmatched)
+	}
+}
+
+// The provider reported cached prompt tokens: the router logs the gross
+// prompt (35000) plus cached (5000); opencode records input net of cache
+// (30000) with cache read 5000. No exact tuple match, but the same session,
+// output and prompt total pair on the fallback.
+func TestChatCachedTokensFallback(t *testing.T) {
+	srcID = 0
+	st := testStore(t)
+	seedRequest(t, st, "ocA", t0, 30000, 190, 0, 5000)
+	// Same session, different output: must not be picked by the fallback.
+	seedRequest(t, st, "ocA2", t0.Add(5*time.Second), 30000, 191, 0, 5000)
+
+	src := &fakeSource{rows: []Row{chatRow(1, t0.Add(-2*time.Second), "sess-ocA", 35000, 190, iptr(5000))}}
+	stats, err := (&Ingester{Src: src}).Run(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Matched != 1 || stats.Unmatched != 0 {
+		t.Fatalf("stats = %+v, want Matched=1", stats)
+	}
+	if got := pairs(t, st); got[1] != "ocA" {
+		t.Errorf("pairs = %v, want pg 1→ocA", got)
+	}
+}
+
+// The fallback never leaves the session either.
+func TestChatFallbackNoCrossSession(t *testing.T) {
+	srcID = 0
+	st := testStore(t)
+	seedRequest(t, st, "ocB", t0, 30000, 190, 0, 5000)
+
+	src := &fakeSource{rows: []Row{chatRow(1, t0, "sess-ocA", 35000, 190, iptr(5000))}}
+	stats, err := (&Ingester{Src: src}).Run(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Matched != 0 || stats.Unmatched != 1 {
+		t.Errorf("stats = %+v, want Matched=0 Unmatched=1", stats)
+	}
+}
