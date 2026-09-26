@@ -88,6 +88,15 @@ turns "router requests" / "catalog" links into `postMessage` jumps
 (`{type:"tokenator-jump", tab, session|model}`) the shell routes through its
 hash grammar. Standalone pages are unchanged.
 
+## JSON API
+
+The same data the four pages render, for the router dashboard's native
+Tokens tab: `GET /api/sessions?q=&project=&since=&limit=`,
+`GET /api/session/{key}`, `GET /api/session/{key}/transcript?q=&offset=&limit=`
+(paged, 500 entries per page by default), `GET /api/model/{name}?limit=`.
+Envelope `{"data": …}` / `{"error": "…"}`, `Cache-Control: no-store`, same
+(non-)auth as the pages; served under the base path too.
+
 ## Data freshness (optional but recommended)
 
 `serve` only reads the DB; ingestion is separate. Today ingest runs
