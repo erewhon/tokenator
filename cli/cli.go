@@ -169,7 +169,8 @@ func cmdIngest(args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "database path")
 	claudeRoot := fs.String("claude-root", "", "Claude Code projects dir (default ~/.claude/projects)")
-	opencodeRoot := fs.String("opencode-root", "", "OpenCode storage dir (default ~/.local/share/opencode/storage)")
+	opencodeRoot := fs.String("opencode-root", "", "OpenCode storage dir (default ~/.local/share/opencode/storage; legacy JSON tree)")
+	opencodeDB := fs.String("opencode-db", "", "OpenCode database (default ~/.local/share/opencode/opencode.db; OpenCode 1.18+)")
 	regime := fs.String("regime", "subscription", "billing regime for the Claude Code source: subscription|metered")
 	full := fs.Bool("full", false, "re-parse all files even if unchanged (needed once after schema upgrades)")
 	if err := parseFlags(fs, args); err != nil {
@@ -190,16 +191,15 @@ func cmdIngest(args []string) error {
 	}
 	log.Printf("claude_code: %s (%.1fs)", ccStats, time.Since(start).Seconds())
 
-	oc := &opencode.Ingester{Root: *opencodeRoot, Full: *full}
-	if root, err := ocRootOrSkip(oc); err == nil && root != "" {
-		start = time.Now()
-		ocStats, err := oc.Run(st)
-		if err != nil {
-			return err
-		}
+	oc := &opencode.Ingester{Root: *opencodeRoot, DB: *opencodeDB, Full: *full}
+	start = time.Now()
+	switch ocStats, err := oc.Run(st); {
+	case errors.Is(err, opencode.ErrNoStorage):
+		log.Print("opencode: neither storage tree nor opencode.db found, skipping")
+	case err != nil:
+		return err
+	default:
 		log.Printf("opencode: %s (%.1fs)", ocStats, time.Since(start).Seconds())
-	} else {
-		log.Print("opencode: storage dir not found, skipping")
 	}
 
 	// New transcript rows may pair with already-captured gateway rows.
@@ -209,27 +209,6 @@ func cmdIngest(args []string) error {
 		log.Printf("reqlog: matched %d gateway rows to new transcript requests", matched)
 	}
 	return nil
-}
-
-// ocRootOrSkip resolves the OpenCode root and returns "" when it doesn't
-// exist (OpenCode not installed on this machine) so ingest can skip quietly.
-func ocRootOrSkip(oc *opencode.Ingester) (string, error) {
-	root := oc.Root
-	if root == "" {
-		if x := os.Getenv("XDG_DATA_HOME"); x != "" {
-			root = filepath.Join(x, "opencode", "storage")
-		} else {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return "", err
-			}
-			root = filepath.Join(home, ".local", "share", "opencode", "storage")
-		}
-	}
-	if _, err := os.Stat(root); err != nil {
-		return "", nil
-	}
-	return root, nil
 }
 
 func cmdReport(args []string) error {

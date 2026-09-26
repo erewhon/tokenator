@@ -12,6 +12,8 @@ import (
 
 func testStore(t *testing.T) *store.Store {
 	t.Helper()
+	// Keep the default opencode.db lookup away from the developer's real one.
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)

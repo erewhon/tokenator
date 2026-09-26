@@ -48,6 +48,9 @@ func Locate(sourceKind, root, sessionKey string) ([]string, error) {
 		sort.Strings(files)
 		return files, nil
 	case "opencode":
+		if isOpenCodeDB(root) {
+			return locateOpenCodeDB(root, sessionKey)
+		}
 		dir := filepath.Join(root, "message", sessionKey)
 		if _, err := os.Stat(dir); err != nil {
 			return nil, fmt.Errorf("no message dir for session %s under %s", sessionKey, root)
@@ -75,7 +78,11 @@ func Load(sourceKind, root, sessionKey string) ([]Entry, error) {
 			entries = append(entries, es...)
 		}
 	case "opencode":
-		entries, err = loadOpenCodeSession(root, sessionKey)
+		if isOpenCodeDB(root) {
+			entries, err = loadOpenCodeDBSession(root, sessionKey)
+		} else {
+			entries, err = loadOpenCodeSession(root, sessionKey)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -272,6 +279,35 @@ type ocPart struct {
 	} `json:"state"`
 }
 
+// entriesFromOCPart maps one OpenCode part to display entries: text and
+// reasoning are one entry each; a tool part carries both the call and its
+// result, so it yields up to two. Bookkeeping parts (step-start,
+// step-finish, patch, compaction) yield none.
+func entriesFromOCPart(p *ocPart, role, ts string) []Entry {
+	e := Entry{TS: ts, Role: role}
+	switch p.Type {
+	case "text":
+		e.Kind, e.Text = textKind(role, false), p.Text
+	case "reasoning":
+		e.Kind, e.Text = "thinking", p.Text
+	case "tool":
+		e.Kind, e.Tool = "tool_use", p.Tool
+		if p.State != nil {
+			e.Text = compactJSON(p.State.Input)
+		}
+		out := []Entry{e}
+		if p.State != nil && len(p.State.Output) > 0 {
+			out = append(out, Entry{TS: ts, Role: role, Kind: "tool_result",
+				Tool: p.Tool, IsError: p.State.Status == "error",
+				Text: resultText(p.State.Output)})
+		}
+		return out
+	default:
+		return nil
+	}
+	return []Entry{e}
+}
+
 func loadOpenCodeSession(root, sessionKey string) ([]Entry, error) {
 	msgPaths, err := filepath.Glob(filepath.Join(root, "message", sessionKey, "*.json"))
 	if err != nil {
@@ -303,29 +339,7 @@ func loadOpenCodeSession(root, sessionKey string) ([]Entry, error) {
 			if err := json.Unmarshal(pdata, &p); err != nil {
 				continue
 			}
-			e := Entry{TS: ts, Role: m.Role}
-			switch p.Type {
-			case "text":
-				e.Kind, e.Text = textKind(m.Role, false), p.Text
-			case "reasoning":
-				e.Kind, e.Text = "thinking", p.Text
-			case "tool":
-				// One part carries both call and result; emit both when present.
-				e.Kind, e.Tool = "tool_use", p.Tool
-				if p.State != nil {
-					e.Text = compactJSON(p.State.Input)
-				}
-				out = append(out, e)
-				if p.State != nil && len(p.State.Output) > 0 {
-					out = append(out, Entry{TS: ts, Role: m.Role, Kind: "tool_result",
-						Tool: p.Tool, IsError: p.State.Status == "error",
-						Text: resultText(p.State.Output)})
-				}
-				continue
-			default:
-				continue
-			}
-			out = append(out, e)
+			out = append(out, entriesFromOCPart(&p, m.Role, ts)...)
 		}
 	}
 	return out, nil

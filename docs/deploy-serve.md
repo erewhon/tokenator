@@ -32,7 +32,8 @@ README); the delphi one is kept as history.
 |---|---|---|
 | `~/.local/share/tokenator/tokenator.db` (+ `-wal`/`-shm`) | read/write | the database (WAL sidecars) |
 | `~/.claude/projects/` | read-only | Claude Code transcripts (content search/reading) |
-| `~/.local/share/opencode/storage/` | read-only | OpenCode transcripts |
+| `~/.local/share/opencode/storage/` | read-only | OpenCode transcripts (JSON tree, OpenCode ≤1.1x) |
+| `~/.local/share/opencode/opencode.db` | read-only | OpenCode transcripts (SQLite, OpenCode 1.18+); `ingest` and `serve` read whichever exists, both if both do |
 
 The natural shape is a **systemd user service**, matching the existing
 `tokenator-otel` unit (`~/.config/systemd/user/tokenator-otel.service`,

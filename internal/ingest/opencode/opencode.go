@@ -1,12 +1,20 @@
-// Package opencode ingests OpenCode session storage
-// (~/.local/share/opencode/storage/) into the store.
+// Package opencode ingests OpenCode session storage into the store, from
+// either of the two layouts OpenCode has used:
 //
-// Layout, verified empirically (2026-07, OpenCode ~1.1.x; see
-// docs/phase1-profiler.md):
+//   - the JSON tree (~/.local/share/opencode/storage/, OpenCode ~1.1.x,
+//     verified 2026-07; see docs/phase1-profiler.md):
 //
-//	storage/session/<projectDirID>/<ses_*>.json   session metadata
-//	storage/message/<ses_*>/<msg_*>.json          one file per message
-//	storage/part/...                              message content (not read in M1)
+//     storage/session/<projectDirID>/<ses_*>.json   session metadata
+//     storage/message/<ses_*>/<msg_*>.json          one file per message
+//     storage/part/<msg_*>/<prt_*>.json             message content
+//
+//   - the SQLite database (~/.local/share/opencode/opencode.db, OpenCode
+//     1.18.x, verified 2026-09; see db.go): tables session, message, part
+//     with the same JSON in a `data` column and ids/timestamps as columns.
+//
+// Both are ingested when present, as separate sources; the tree is the
+// legacy era on a host that migrated. Request rows dedupe on message id
+// across sources, so a message that appears in both is counted once.
 //
 // Assistant message files carry role, providerID/modelID, cost, finish, and
 // tokens {input, output, reasoning, cache {read, write}}. Unlike Claude
@@ -21,6 +29,7 @@ package opencode
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,10 +42,17 @@ import (
 
 const SourceKind = "opencode"
 
+// ErrNoStorage is returned by Run when neither the storage tree nor the
+// database exists: OpenCode is not installed on this machine.
+var ErrNoStorage = errors.New("opencode: no storage tree or opencode.db found")
+
 type Ingester struct {
 	// Root is the storage directory; empty means
 	// ~/.local/share/opencode/storage (respecting XDG_DATA_HOME).
 	Root string
+	// DB is the opencode.db path; empty means
+	// ~/.local/share/opencode/opencode.db (respecting XDG_DATA_HOME).
+	DB string
 	// Regime is the billing regime recorded on the source row. OpenCode
 	// mixes providers (local, per-token remote) in one store, so the
 	// default is "mixed"; per-provider regime mapping is a later feature.
@@ -133,18 +149,50 @@ func (pi partToolInput) path() string {
 	return ""
 }
 
-func (ing *Ingester) root() (string, error) {
-	if ing.Root != "" {
-		return ing.Root, nil
-	}
+// dataDir is OpenCode's data directory: $XDG_DATA_HOME/opencode or
+// ~/.local/share/opencode.
+func dataDir() (string, error) {
 	if x := os.Getenv("XDG_DATA_HOME"); x != "" {
-		return filepath.Join(x, "opencode", "storage"), nil
+		return filepath.Join(x, "opencode"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".local", "share", "opencode", "storage"), nil
+	return filepath.Join(home, ".local", "share", "opencode"), nil
+}
+
+func (ing *Ingester) root() (string, error) {
+	if ing.Root != "" {
+		return ing.Root, nil
+	}
+	d, err := dataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "storage"), nil
+}
+
+func (ing *Ingester) dbPath() (string, error) {
+	if ing.DB != "" {
+		return ing.DB, nil
+	}
+	d, err := dataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "opencode.db"), nil
+}
+
+// add sums two runs' stats (tree + db).
+func (st Stats) add(o Stats) Stats {
+	return Stats{
+		SessionFiles: st.SessionFiles + o.SessionFiles, MessageFiles: st.MessageFiles + o.MessageFiles,
+		PartFiles: st.PartFiles + o.PartFiles, FilesSkipped: st.FilesSkipped + o.FilesSkipped,
+		Sessions: st.Sessions + o.Sessions, Requests: st.Requests + o.Requests, Updated: st.Updated + o.Updated,
+		Incomplete: st.Incomplete + o.Incomplete, Blocks: st.Blocks + o.Blocks,
+		BlocksUpdated: st.BlocksUpdated + o.BlocksUpdated, ParseErrors: st.ParseErrors + o.ParseErrors,
+	}
 }
 
 func (ing *Ingester) regime() string {
@@ -154,16 +202,61 @@ func (ing *Ingester) regime() string {
 	return "mixed"
 }
 
-// Run ingests changed session and message files. Both kinds are tracked in
-// ingest_file; message files are re-parsed whenever size or mtime moves,
-// and UpsertRequest makes that refresh idempotent.
+// Run ingests whatever OpenCode storage exists: the JSON tree, the
+// database, or both. Each is its own source. ErrNoStorage when neither is
+// there.
 func (ing *Ingester) Run(st *store.Store) (Stats, error) {
 	var stats Stats
 	root, err := ing.root()
 	if err != nil {
 		return stats, err
 	}
+	db, err := ing.dbPath()
+	if err != nil {
+		return stats, err
+	}
+	ran := false
+	if fi, err := os.Stat(root); err == nil && fi.IsDir() {
+		ts, err := ing.runTree(st, root)
+		if err != nil {
+			return stats, err
+		}
+		stats, ran = stats.add(ts), true
+	}
+	if fi, err := os.Stat(db); err == nil && !fi.IsDir() {
+		ds, err := ing.runDB(st, db)
+		if err != nil {
+			return stats, err
+		}
+		stats, ran = stats.add(ds), true
+	}
+	if !ran {
+		return stats, ErrNoStorage
+	}
+	return stats, nil
+}
 
+// fileRecord is what ingest_file remembers per artifact so an unchanged one
+// is skipped next run: a path (or a synthetic key for database rows), its
+// size, and its mtime (or the row's time_updated).
+type fileRecord struct {
+	path  string
+	size  int64
+	mtime int64
+}
+
+// pendingBlock is a block waiting for its session's row id.
+type pendingBlock struct {
+	sessionKey string
+	blk        store.Block
+}
+
+// runTree ingests changed session, message and part files from the JSON
+// tree. All three kinds are tracked in ingest_file; message files are
+// re-parsed whenever size or mtime moves, and UpsertRequest makes that
+// refresh idempotent.
+func (ing *Ingester) runTree(st *store.Store, root string) (Stats, error) {
+	var stats Stats
 	sourceID, err := st.UpsertSource(SourceKind, root, ing.regime())
 	if err != nil {
 		return stats, err
@@ -193,11 +286,6 @@ func (ing *Ingester) Run(st *store.Store) (Stats, error) {
 		return stats, err
 	}
 	sort.Strings(sessionPaths)
-	type fileRecord struct {
-		path  string
-		size  int64
-		mtime int64
-	}
 	var parsedFiles []fileRecord
 	for _, path := range sessionPaths {
 		size, mtime, isChanged, err := changed(path)
@@ -270,10 +358,6 @@ func (ing *Ingester) Run(st *store.Store) (Stats, error) {
 		return &mf
 	}
 
-	type pendingBlock struct {
-		sessionKey string
-		blk        store.Block
-	}
 	var pendingBlocks []pendingBlock
 	partPaths, err := filepath.Glob(filepath.Join(root, "part", "*", "*.json"))
 	if err != nil {
@@ -314,6 +398,14 @@ func (ing *Ingester) Run(st *store.Store) (Stats, error) {
 		}
 	}
 
+	return commit(st, sourceID, sessMeta, bySession, pendingBlocks, parsedFiles, stats)
+}
+
+// commit writes one run's parsed sessions, messages and parts, then records
+// the artifacts so the next run skips them. Shared by the tree and the
+// database readers.
+func commit(st *store.Store, sourceID int64, sessMeta map[string]*sessionFile, bySession map[string][]*messageFile,
+	pendingBlocks []pendingBlock, parsedFiles []fileRecord, stats Stats) (Stats, error) {
 	// Every session that has new metadata, messages, or parts gets one
 	// upsert; sessions only present via messages/parts get a shell row
 	// (metadata merges in whenever the session file next changes).
@@ -327,7 +419,7 @@ func (ing *Ingester) Run(st *store.Store) (Stats, error) {
 	for _, pb := range pendingBlocks {
 		touched[pb.sessionKey] = true
 	}
-	err = st.WithTx(func(tx *store.Tx) error {
+	err := st.WithTx(func(tx *store.Tx) error {
 		ids := map[string]int64{}
 		keys := make([]string, 0, len(touched))
 		for id := range touched {
