@@ -6,10 +6,11 @@
 // The pull is incremental by origin row id (BIGSERIAL, append-only): the
 // cursor is MAX(pg_id) already stored for the source, so re-runs only fetch
 // new rows and re-ingests are no-ops via the dedupe key. After each pull the
-// store's MatchGwRequests pairs anthropic-class rows with transcript request
-// rows by usage tuple + time proximity, within the row's own harness session
-// when the router logged one (router_requests.session_id, llm-router-go
-// f00737c+). Older routers have no such column; Fetch detects that once and
+// store's MatchGwRequests pairs anthropic-class rows (and session-bearing
+// chat-class rows) with transcript request rows by usage tuple + time
+// proximity, within the row's own harness session when the router logged
+// one (router_requests.session_id, llm-router-go f00737c+); the pass is
+// incremental over what changed since the last one. Older routers have no such column; Fetch detects that once and
 // reads an empty id instead, so tokenator keeps working against an
 // un-upgraded origin.
 //

@@ -249,7 +249,34 @@ const schemaV8 = `
 CREATE INDEX idx_request_usage ON request(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens);
 `
 
-var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7, schemaV8}
+// schemaV9 adds a small key/value table. Its first use is the pairing pass's
+// high-water marks (see MatchGwRequests): the largest gw_request and request
+// ids the last pass saw, so a run only revisits what changed since.
+const schemaV9 = `
+CREATE TABLE meta (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+`
+
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7, schemaV8, schemaV9}
+
+// Meta reads one key from the meta table ("" when unset).
+func (s *Store) Meta(key string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
+}
+
+// SetMeta writes one key.
+func (s *Store) SetMeta(key, value string) error {
+	_, err := s.db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?)
+		ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
 
 // Block.Referenced states.
 const (
@@ -794,10 +821,35 @@ const gwMatchWindowMinutes = 30.0
 // never wrote to a transcript (count_tokens probes, quota pings, opencode's
 // title/summary side calls, other machines' traffic).
 //
-// Returns how many rows were newly matched and how many usage-bearing
-// candidate rows remain unmatched. Idempotent; call after every ingest (new
-// gateway rows and new transcript rows both create match opportunities).
+// Incremental by default: a pairing opportunity only appears when a gateway
+// row or a transcript request is new, so a pass considers the gateway rows
+// inserted since the last pass plus the still-unmatched rows whose
+// timestamp falls within the match window of any request inserted since
+// the last pass. Everything else was already tried against an unchanged
+// request set. The ids seen at the start of a pass are stored in meta once
+// every chunk commits; a failed pass leaves them alone so the next one
+// redoes the work. MatchGwRequestsAll ignores the marks and sweeps every
+// pending row (after a restore, or to be sure).
+//
+// Returns how many rows were newly matched and how many of the rows this
+// pass considered remain unmatched — for the incremental pass that is the
+// new/newly-relevant rows, not the historical backlog.
 func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
+	return s.matchGwRequests(false)
+}
+
+// MatchGwRequestsAll pairs over every pending gateway row, ignoring the
+// incremental marks, then records them.
+func (s *Store) MatchGwRequestsAll() (matched, unmatched int64, err error) {
+	return s.matchGwRequests(true)
+}
+
+const (
+	metaMatchGwHWM  = "match_gw_hwm"  // max gw_request.id seen by the last pass
+	metaMatchReqHWM = "match_req_hwm" // max request.id seen by the last pass
+)
+
+func (s *Store) matchGwRequests(full bool) (matched, unmatched int64, err error) {
 	type cand struct {
 		id                  int64
 		ts                  string
@@ -808,16 +860,52 @@ func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
 	// chunk: a long read-then-write transaction would fail with
 	// SQLITE_BUSY_SNAPSHOT the moment another connection (the otel receiver,
 	// a concurrent reqlog pull) committed while it was scanning.
+	// Marks from the last pass, and the ids this pass will record.
+	var gwHWM, reqHWM, gwMax, reqMax int64
+	if v, err := s.Meta(metaMatchGwHWM); err != nil {
+		return 0, 0, err
+	} else if v != "" {
+		fmt.Sscan(v, &gwHWM)
+	}
+	if v, err := s.Meta(metaMatchReqHWM); err != nil {
+		return 0, 0, err
+	} else if v != "" {
+		fmt.Sscan(v, &reqHWM)
+	}
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM gw_request`).Scan(&gwMax); err != nil {
+		return 0, 0, err
+	}
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM request`).Scan(&reqMax); err != nil {
+		return 0, 0, err
+	}
+
+	// Scope: everything, or new gateway rows plus pending rows within the
+	// window of the new transcript requests.
+	where := `request_key = '' AND status = 200
+		  AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL
+		  AND (api_class = 'anthropic' OR (api_class = 'chat' AND session_id != ''))`
+	var args []any
+	if !full {
+		var lo, hi sql.NullString
+		if err := s.db.QueryRow(`SELECT MIN(ts), MAX(ts) FROM request WHERE id > ?`, reqHWM).Scan(&lo, &hi); err != nil {
+			return 0, 0, err
+		}
+		if lo.Valid {
+			where += ` AND (id > ? OR (julianday(ts) >= julianday(?) - ? AND julianday(ts) <= julianday(?) + ?))`
+			args = append(args, gwHWM, lo.String, gwMatchWindowMinutes/1440.0, hi.String, gwMatchWindowMinutes/1440.0)
+		} else {
+			where += ` AND id > ?`
+			args = append(args, gwHWM)
+		}
+	}
 	var pending []cand
 	rows, err := s.db.Query(`
 		SELECT id, ts, input_tokens, output_tokens,
 			COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0),
 			session_id, api_class
 		FROM gw_request
-		WHERE request_key = '' AND status = 200
-		  AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL
-		  AND (api_class = 'anthropic' OR (api_class = 'chat' AND session_id != ''))
-		ORDER BY ts`)
+		WHERE `+where+`
+		ORDER BY ts`, args...)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -892,6 +980,14 @@ func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
 		}
 		matched += m
 		unmatched += u
+	}
+	// Every chunk committed: rows up to these ids have been tried against
+	// the request set as it stood when the pass began.
+	if err := s.SetMeta(metaMatchGwHWM, fmt.Sprint(gwMax)); err != nil {
+		return matched, unmatched, err
+	}
+	if err := s.SetMeta(metaMatchReqHWM, fmt.Sprint(reqMax)); err != nil {
+		return matched, unmatched, err
 	}
 	return matched, unmatched, nil
 }

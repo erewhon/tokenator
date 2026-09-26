@@ -541,6 +541,7 @@ func cmdReqlog(ctx context.Context, args []string) error {
 	regime := fs.String("regime", "subscription",
 		"billing regime for this source: subscription|metered|local|unknown")
 	status := fs.Bool("status", false, "print captured-data summary, then exit")
+	matchAll := fs.Bool("match-all", false, "re-run the transcript pairing over every pending gateway row (no Postgres needed), then exit; the normal pass is incremental")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -558,10 +559,19 @@ func cmdReqlog(ctx context.Context, args []string) error {
 		}
 		return report.RenderGwStatus(os.Stdout, gs)
 	}
+	if *matchAll {
+		start := time.Now()
+		matched, unmatched, err := st.MatchGwRequestsAll()
+		if err != nil {
+			return err
+		}
+		log.Printf("reqlog: full pairing sweep matched=+%d unmatched=%d (%.1fs)", matched, unmatched, time.Since(start).Seconds())
+		return nil
+	}
 
 	if *dsn == "" {
 		return fmt.Errorf(`no DSN: set --dsn or TOKENATOR_REQLOG_DSN, e.g.
-  postgres://router:$(ho secret get llm-router/reqlog-pg-password)@euclid.m.bcc.sh:5433/router`)
+  postgres://router:$(ho secret get llm-router/reqlog-pg-password)@192.168.42.20:5433/router`)
 	}
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()

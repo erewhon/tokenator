@@ -389,3 +389,48 @@ func TestChatFallbackNoCrossSession(t *testing.T) {
 		t.Errorf("stats = %+v, want Matched=0 Unmatched=1", stats)
 	}
 }
+
+// The incremental pass leaves the historical backlog alone: a gateway row
+// that has already been tried is not re-tried until a transcript request
+// lands in its time window, and rows far from any new request are never
+// touched. MatchGwRequestsAll sweeps everything.
+func TestMatchIsIncremental(t *testing.T) {
+	srcID = 0
+	st := testStore(t)
+	src := &fakeSource{rows: []Row{
+		anthRow(1, t0, 42, 99, 1000, 2000),            // its transcript arrives later
+		anthRow(2, t0.Add(-48*time.Hour), 7, 7, 0, 0), // never gets one
+	}}
+	stats, err := (&Ingester{Src: src}).Run(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Matched != 0 || stats.Unmatched != 2 {
+		t.Fatalf("first pass = %+v, want Unmatched=2", stats)
+	}
+	// Nothing new: nothing to consider.
+	if m, u, err := st.MatchGwRequests(); err != nil || m != 0 || u != 0 {
+		t.Fatalf("idle pass = (%d, %d, %v), want (0, 0)", m, u, err)
+	}
+	// A transcript request near row 1 makes row 1 (only) a candidate again.
+	seedRequest(t, st, "late", t0.Add(2*time.Minute), 42, 99, 1000, 2000)
+	if m, u, err := st.MatchGwRequests(); err != nil || m != 1 || u != 0 {
+		t.Fatalf("after late transcript = (%d, %d, %v), want (1, 0): row 2 is out of range and must not be scanned", m, u, err)
+	}
+	if got := pairs(t, st); got[1] != "late" {
+		t.Errorf("pairs = %v, want pg 1→late", got)
+	}
+	// The full sweep still sees the old row.
+	if m, u, err := st.MatchGwRequestsAll(); err != nil || m != 0 || u != 1 {
+		t.Fatalf("full sweep = (%d, %d, %v), want (0, 1)", m, u, err)
+	}
+	// A new gateway row is always considered, even with no new transcript.
+	src.rows = append(src.rows, anthRow(3, t0.Add(-24*time.Hour), 8, 8, 0, 0))
+	stats, err = (&Ingester{Src: src}).Run(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.New != 1 || stats.Unmatched != 1 {
+		t.Fatalf("new gw row pass = %+v, want New=1 Unmatched=1 (only the new row)", stats)
+	}
+}
