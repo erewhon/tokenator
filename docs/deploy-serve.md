@@ -22,8 +22,11 @@ runtime deps).
 
 ## Where it must run — data locality
 
-Everything it reads lives under **erewhon's home on delphi**, so it must run
-there, as that user. Do not containerize it away from this data:
+Everything it reads lives under **erewhon's home on the box where the coding
+sessions happen** (euclid since 2026-09; delphi before that), so it must run
+there, as that user. Do not containerize it away from this data. The live
+deploy is `homeops/config/euclid/tokenator-serve/` (units, nftables lock,
+README); the delphi one is kept as history.
 
 | Path | Access | Purpose |
 |---|---|---|
@@ -82,10 +85,17 @@ tokenator reqlog            # gateway rows from the router reqlog Postgres
 ```
 
 - Concurrent ingest-while-serving is safe: WAL journal mode,
-  `busy_timeout=5000`, single-connection pools on both sides.
+  `busy_timeout=5000`, single-connection pools on both sides. Concurrent
+  ingest-while-**otel**-receives is safe since schemaV8: the gateway pairing
+  pass runs in short per-chunk transactions over an indexed usage tuple
+  (before, one 11-minute transaction that any otel write aborted with
+  SQLITE_BUSY_SNAPSHOT).
+- **NFS homes:** SQLite WAL does not work over NFS. Put the DB on local disk
+  and symlink `~/.local/share/tokenator` to it (euclid does this).
 - `tokenator reqlog` needs `TOKENATOR_REQLOG_DSN`:
-  `postgres://router:<pw>@euclid.m.bcc.sh:5433/router` — password via
-  `ho secret get llm-router/reqlog-pg-password`, reachable over NetBird.
+  `postgres://router:<pw>@192.168.42.20:5433/router` (the hekaton incus proxy
+  into the `reqlog-pg` instance; the old euclid:5433 docker Postgres is gone) —
+  password via `ho secret get llm-router/reqlog-pg-password`.
   If the timer omits reqlog, only wire-level cache data lags; the browser
   itself needs just `ingest`.
 

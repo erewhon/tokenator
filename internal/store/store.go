@@ -240,7 +240,16 @@ ALTER TABLE gw_request ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX idx_gw_request_session ON gw_request(session_id) WHERE session_id != '';
 `
 
-var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7}
+// schemaV8 indexes the usage tuple MatchGwRequests joins on. Without it every
+// pending gateway row scanned the whole request table: with delphi's history
+// (500k+ unmatched rows, most of them PAT traffic that never had a transcript)
+// one pass took 11 minutes inside a single transaction, and any concurrent
+// writer (the otel receiver) made it fail with SQLITE_BUSY_SNAPSHOT.
+const schemaV8 = `
+CREATE INDEX idx_request_usage ON request(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens);
+`
+
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7, schemaV8}
 
 // Block.Referenced states.
 const (
@@ -772,68 +781,86 @@ const gwMatchWindowMinutes = 30.0
 // anthropic rows remain unmatched. Idempotent; call after every ingest (new
 // gateway rows and new transcript rows both create match opportunities).
 func (s *Store) MatchGwRequests() (matched, unmatched int64, err error) {
-	err = s.WithTx(func(t *Tx) error {
-		rows, err := t.tx.Query(`
-			SELECT id, ts, input_tokens, output_tokens,
-				COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0),
-				session_id
-			FROM gw_request
-			WHERE request_key = '' AND api_class = 'anthropic' AND status = 200
-			  AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL
-			ORDER BY ts`)
+	type cand struct {
+		id                  int64
+		ts                  string
+		in, out, ccre, cred int64
+		session             string
+	}
+	// One short read for the pending set, then short write transactions per
+	// chunk: a long read-then-write transaction would fail with
+	// SQLITE_BUSY_SNAPSHOT the moment another connection (the otel receiver,
+	// a concurrent reqlog pull) committed while it was scanning.
+	var pending []cand
+	rows, err := s.db.Query(`
+		SELECT id, ts, input_tokens, output_tokens,
+			COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0),
+			session_id
+		FROM gw_request
+		WHERE request_key = '' AND api_class = 'anthropic' AND status = 200
+		  AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL
+		ORDER BY ts`)
+	if err != nil {
+		return 0, 0, err
+	}
+	for rows.Next() {
+		var c cand
+		if err := rows.Scan(&c.id, &c.ts, &c.in, &c.out, &c.ccre, &c.cred, &c.session); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		pending = append(pending, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	const chunk = 2000
+	for i := 0; i < len(pending); i += chunk {
+		end := i + chunk
+		if end > len(pending) {
+			end = len(pending)
+		}
+		var m, u int64
+		err := s.WithTx(func(t *Tx) error {
+			m, u = 0, 0
+			for _, c := range pending[i:end] {
+				var key string
+				err := t.tx.QueryRow(`
+					SELECT r.dedupe_key FROM request r
+					WHERE r.input_tokens = ? AND r.output_tokens = ?
+					  AND r.cache_creation_tokens = ? AND r.cache_read_tokens = ?
+					  AND ABS(julianday(r.ts) - julianday(?)) * 1440.0 <= ?
+					  AND NOT EXISTS (SELECT 1 FROM gw_request g WHERE g.request_key = r.dedupe_key)
+					  AND (? = '' OR r.session_id IN
+					      (SELECT id FROM session WHERE harness_session_id = ?))
+					ORDER BY ABS(julianday(r.ts) - julianday(?))
+					LIMIT 1`,
+					c.in, c.out, c.ccre, c.cred, c.ts, gwMatchWindowMinutes,
+					c.session, c.session, c.ts).Scan(&key)
+				if err == sql.ErrNoRows {
+					u++
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				if _, err := t.tx.Exec(
+					`UPDATE gw_request SET request_key = ? WHERE id = ?`, key, c.id); err != nil {
+					return err
+				}
+				m++
+			}
+			return nil
+		})
 		if err != nil {
-			return err
+			return matched, unmatched, err
 		}
-		type cand struct {
-			id                  int64
-			ts                  string
-			in, out, ccre, cred int64
-			session             string
-		}
-		var pending []cand
-		for rows.Next() {
-			var c cand
-			if err := rows.Scan(&c.id, &c.ts, &c.in, &c.out, &c.ccre, &c.cred, &c.session); err != nil {
-				rows.Close()
-				return err
-			}
-			pending = append(pending, c)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		for _, c := range pending {
-			var key string
-			err := t.tx.QueryRow(`
-				SELECT r.dedupe_key FROM request r
-				WHERE r.input_tokens = ? AND r.output_tokens = ?
-				  AND r.cache_creation_tokens = ? AND r.cache_read_tokens = ?
-				  AND ABS(julianday(r.ts) - julianday(?)) * 1440.0 <= ?
-				  AND r.dedupe_key NOT IN
-				      (SELECT request_key FROM gw_request WHERE request_key != '')
-				  AND (? = '' OR r.session_id IN
-				      (SELECT id FROM session WHERE harness_session_id = ?))
-				ORDER BY ABS(julianday(r.ts) - julianday(?))
-				LIMIT 1`,
-				c.in, c.out, c.ccre, c.cred, c.ts, gwMatchWindowMinutes,
-				c.session, c.session, c.ts).Scan(&key)
-			if err == sql.ErrNoRows {
-				unmatched++
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if _, err := t.tx.Exec(
-				`UPDATE gw_request SET request_key = ? WHERE id = ?`, key, c.id); err != nil {
-				return err
-			}
-			matched++
-		}
-		return nil
-	})
-	return matched, unmatched, err
+		matched += m
+		unmatched += u
+	}
+	return matched, unmatched, nil
 }
 
 // GwStatus summarizes captured gateway data for `tokenator reqlog --status`.
