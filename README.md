@@ -13,8 +13,9 @@ conversations.
 ## Install
 
 ```sh
-# Homebrew (macOS)
-brew install --cask erewhon/tap/tokenator
+# Homebrew (macOS); the tap lives on code.middlefork.org, so name its URL
+brew tap smithy/tap https://code.middlefork.org/smithy/homebrew-tap
+brew install --cask smithy/tap/tokenator
 
 # Go
 go install github.com/erewhon/tokenator/cmd/tokenator@latest

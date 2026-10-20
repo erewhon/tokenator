@@ -1,5 +1,5 @@
 # GoReleaser — builds the `tokenator` CLI and publishes a Homebrew cask to
-# github.com/erewhon/homebrew-tap on every `vX.Y.Z` tag.
+# smithy/homebrew-tap on code.middlefork.org on every `vX.Y.Z` tag.
 # Docs: https://goreleaser.com
 version: 2
 
@@ -39,9 +39,21 @@ checksum:
   name_template: checksums.txt
 
 release:
-  github:
-    owner: erewhon
-    name: tokenator
+  # GitHub releases retired 2026-10-20: binaries are release assets on
+  # code.middlefork.org, and the tap is smithy/homebrew-tap there.
+  # Cut a release from a workstation (sprinkle-runner has no secrets):
+  #   git tag -a vX.Y.Z -m ... && git push code-public vX.Y.Z
+  #   MIDDLEFORK_TOKEN=$(ho secret get code-public/release-token) \
+  #   TAP_SSH_KEY=~/.ssh/id_ed25519 goreleaser release --clean
+  disable: true
+
+publishers:
+  - name: middlefork
+    checksum: true
+    cmd: >-
+      curl -fsS -T "{{ .ArtifactPath }}"
+      -H "Authorization: token {{ .Env.MIDDLEFORK_TOKEN }}"
+      "https://code.middlefork.org/api/v1/repos/smithy/tokenator/releases/{{ .Tag }}/assets/{{ .ArtifactName }}"
 
 # Homebrew: a cask installs the pre-built `tokenator` binary on macOS.
 # (Homebrew-on-Linux has no casks — Linux users grab the release tarball
@@ -53,16 +65,20 @@ homebrew_casks:
     ids:
       - tokenator
     repository:
-      owner: erewhon
+      owner: smithy
       name: homebrew-tap
       branch: main
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+      git:
+        url: "ssh://code.bcc.sh:23232/smithy/homebrew-tap.git"
+        private_key: "{{ .Env.TAP_SSH_KEY }}"
+    url:
+      template: "https://code.middlefork.org/api/v1/repos/smithy/tokenator/releases/{{ .Tag }}/assets/{{ .ArtifactName }}"
     directory: Casks
-    homepage: "https://github.com/erewhon/tokenator"
+    homepage: "https://code.middlefork.org/smithy/tokenator"
     description: "Token and prompt-cache profiler for AI coding agents (Claude Code, OpenCode): usage reports, cache doctor, session browser, A/B bench harness"
     commit_author:
       name: goreleaser-bot
-      email: noreply@byrnes.org
+      email: erewhon@flatland.org
     # The binary is unsigned: strip the Gatekeeper quarantine bit on install so
     # it runs without a "developer cannot be verified" prompt.
     # Homebrew 7 deprecates `postflight` blocks (what hooks.post.install
